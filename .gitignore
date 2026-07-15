@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# build output
+client/dist/
+server/dist/
+
+# local data (runtime database lives here; seeded automatically on first run)
+data/
+
+# logs & temp
+*.log
+.tmp/
+.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# environment (no secrets are required, but never commit env files)
+.env
+.env.*
