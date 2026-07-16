@@ -219,13 +219,17 @@ the JSON error body is surfaced verbatim in the UI.
 
 ## Persistence
 
-`Store` holds the whole document in memory; every mutation schedules a
-debounced (120 ms) **atomic** write — serialize to `*.tmp`, then rename over
-the data file — and broadcasts the changed entity to SSE subscribers.
-`flushSync()` runs on shutdown signals. Events are capped at 3000 (oldest
-trimmed). The store's surface is repository-shaped (`task(id)`,
-`upsertTask`, `eventsForTask`, …) so a SQLite implementation can replace it
-behind the same methods.
+**SQLite (WAL) is the single authoritative store** (`server/src/db/db.ts`,
+Node's built-in `node:sqlite` — zero native dependencies). Domain entities
+are JSON documents with constraint-relevant columns lifted out; operational
+tables (attempts, operations, leases) are fully typed with UNIQUE and
+partial-index guarantees. Foreign keys are on; an integrity check runs at
+boot; every state transition that must be atomic runs in `BEGIN IMMEDIATE`
+transactions; events are an append-oriented log with a bounded tail. A
+legacy v0.2 `command-center.json` is imported once (never modified or
+deleted). The `Store` facade keeps the repository-shaped surface
+(`task(id)`, `upsertTask`, `eventsForTask`, …) and still broadcasts every
+mutation to SSE subscribers.
 
 ## Security boundaries
 
@@ -238,13 +242,44 @@ behind the same methods.
 
 ## Simulated vs real, precisely
 
-| Real and working                                                       | Simulated                                       |
-| ----------------------------------------------------------------------- | ----------------------------------------------- |
-| Intake parsing (rule-based, local)                                      | Hermes execution                                |
-| Routing engine + explanations                                           | Its file changes & test counts in evidence      |
-| Lifecycle state machine + approvals                                     | Its blockers (injected by scenario rules)       |
-| **Claude Code, Codex & Antigravity: real CLI sessions, real diffs**     | Automated test gate for real runs (none in v1)  |
-| SSE live updates, pause/resume/cancel                                   |                                                 |
-| Retry/reassign + structured handoffs                                    |                                                 |
-| Persistence, crash recovery, audit log                                  |                                                 |
-| Full REST API + tests (incl. fake-CLI adapter suites)                   |                                                 |
+| Real and working                                                        | Simulated / experimental                          |
+| ------------------------------------------------------------------------ | ------------------------------------------------- |
+| SQLite WAL persistence; Task→Attempt→Operation durable model             | Hermes execution (simulated, labeled)              |
+| Git project registry + per-attempt worktree isolation                    | Sample-project runs (simulation engine, labeled)   |
+| Exact single-use approval grants (hash+commit bound, expiring)           | Codex repository runner: code-complete, awaits an  |
+| DB leases (task/worker/repo) + idempotent dispatch                       |   authenticated smoke test (honest `unverified`)   |
+| Real git diff evidence + protected-path enforcement                      | Legacy v0.2 workspace adapters (demo path)         |
+| Independent validation runner (UNVERIFIED/PARTIAL/FAILED/VERIFIED)       |                                                    |
+| Crash reconciliation (`unknown_outcome`, re-validate without re-run)     |                                                    |
+| Local security boundary (loopback + token + origin + zod)                |                                                    |
+| SSE live updates; cancel with process-tree kill; full REST API + 60 tests|                                                    |
+
+## Repository-backed execution (v0.3)
+
+```
+Projects registry ──► Task (gitProjectId) ──► exact approval grant
+      │                                            │ approve (tx: consume grant +
+      │                                            ▼  leases + attempt row)
+      │                              AttemptService pipeline
+      │      ┌──────────────┬──────────────┬───────────────┬──────────────┐
+      │      │ create        │ run worker   │ capture REAL  │ independent  │
+      └────► │ worktree      │ (Codex/test  │ git diff +    │ validation   │──► review
+             │ cc/<attempt>  │ runner)      │ protected     │ (argv only)  │    (accept /
+             │ containment-  │ tree-kill    │ paths         │ UNVERIFIED≠  │    correction)
+             │ checked       │ cancel       │               │ PASSED       │
+             └──────────────┴──────────────┴───────────────┴──────────────┘
+```
+
+Key modules: `db/db.ts` (SQLite WAL + migrations + legacy import),
+`git/git.ts` (execFile-only plumbing), `git/projects.ts` (registry +
+sanitizers), `attempts/service.ts` (grants, leases, pipeline, recovery,
+cleanup), `attempts/runners.ts` (TestRunner + hardened CodexRunner +
+redaction + safe spawning), `attempts/validator.ts` (independent checks),
+`security/auth.ts` (token + origin + headers). Attempt states:
+`creating_worktree → running → validating → ready_for_review →
+accepted|rejected`, plus `cancelled | failed | timeout | unknown_outcome |
+blocked_reconciliation`. Every consequential step is an Operation row with a
+unique idempotency key; leases live behind partial unique indexes so
+duplicate dispatch and overlapping executions are impossible at the database
+level. Acceptance never merges or pushes; worktree cleanup is explicit and
+always keeps the attempt branch.

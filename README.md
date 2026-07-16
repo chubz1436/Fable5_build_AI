@@ -1,196 +1,156 @@
 # CHUBZ AI Command Center
 
-Local-first mission control for AI coding workers. One place for Chubz to
-turn a plain-language goal into a structured task, route it to the right AI
-worker, approve the important moments, watch execution live, recover from
-blockers, and review hard evidence before accepting the delivery — instead of
-juggling separate apps and copy-pasting prompts.
+Local-first mission control for AI coding workers — now **repository-backed**.
+Register a local Git repository, create a task, approve an exact execution
+grant, and a worker runs in an **isolated Git worktree** while the Command
+Center captures the **real diff**, runs **independent validation**, and
+presents evidence for the owner's accept/reject decision. Nothing is ever
+merged or pushed automatically, and the owner's working tree is never touched.
 
-> **Honesty up front:** the Command Center is hybrid. **Claude Code, Codex,
-> and Antigravity are real adapters** — when their CLIs are detected at boot,
-> tasks dispatched to them run actual headless CLI sessions in an isolated
-> per-task workspace (each requires a one-time login on this machine:
-> `claude /login`, `codex login`, and the Antigravity app login for `agy`).
-> **Hermes** runs on a local, deterministic **simulation engine** — no
-> external AI is called for it and nothing pretends otherwise; the UI labels
-> every worker's adapter (`REAL · claude-code`, `REAL · codex`,
-> `REAL · antigravity`, or `adapter: simulated`).
-> See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the adapter design.
+## Support matrix (honest)
 
-![stack](https://img.shields.io/badge/stack-TypeScript%20%C2%B7%20Express%205%20%C2%B7%20React%2019%20%C2%B7%20Vite-8b7bff)
-
-## What it does
-
-- **Natural-language intake** — describe a goal ("Urgent: migrate the Games
-  Project save-data schema…"); the system structures it into title, project,
-  risk (+rationale), priority, tags, scope and acceptance criteria.
-- **Explainable worker routing** — a rule engine scores every worker
-  (strengths, availability, health, risk fit) and shows *why* one was chosen.
-- **Owner approvals** — starting a task, high-risk mid-run changes, and final
-  delivery all pause for an explicit approve/reject with notes.
-- **Live execution** — phases, step checklist, progress and a streaming log
-  console over Server-Sent Events.
-- **Blockers & recovery** — pause, resume, cancel, retry, or hand off to
-  another worker with a structured context package (goal, completed work,
-  remaining work, files, risks, exact next action).
-- **Evidence & delivery** — changed files with diff stats, test report, log
-  tail, limitations, confidence, and the owner's final decision.
-- **Local persistence** — everything (projects, tasks, workers, approvals,
-  events, handoffs) survives restarts; interrupted runs are recovered safely
-  as blocked-and-retryable.
-- **Kanban board, worker roster, approvals inbox, activity feed** — all live.
+| Capability                          | Status |
+| ----------------------------------- | ------ |
+| Project registration (local git)    | **Real** |
+| Git worktree isolation per attempt  | **Real** |
+| Exact single-use approval grants    | **Real** (payload-hash + base-commit bound, expiring) |
+| Task → Attempt → Operation history  | **Real** (SQLite WAL, durable) |
+| Concurrency leases (task/worker/repo) | **Real** (DB unique constraints) |
+| Independent validation runner       | **Real** (argv-allowlisted commands, worktree-scoped) |
+| Evidence capture (diff/status/logs) | **Real** (from git, never from worker claims) |
+| Crash/restart reconciliation        | **Real** (`unknown_outcome`, `blocked_reconciliation`) |
+| Local security (loopback + token)   | **Real** |
+| Codex adapter (repository attempts) | **Experimental real integration** — code-complete & hardened; classified `unverified` until an authenticated smoke test runs on your machine |
+| Deterministic test runner           | **Real** (used by all automated tests; `ATTEMPT_RUNNER=test`) |
+| Claude Code / Codex / Antigravity workspace adapters (legacy demo path) | Experimental, unchanged from v0.2 |
+| Hermes                              | Simulated only |
+| Simulation engine (sample projects) | Real code, clearly labeled simulation |
+| Automatic merge / push              | **Not supported by design** |
+| Remote / LAN access                 | **Not enabled by default** (loopback bind; refuses non-loopback without explicit token) |
 
 ## Quick start
 
-Requirements: Node.js ≥ 20 (no database, no Docker, no API keys).
+Requirements: Node.js ≥ 24 (built-in SQLite; no native deps), git.
 
 ```bash
 npm install
 npm run build     # build the UI once
-npm start         # http://localhost:4680  (API + UI, single process)
+npm start
 ```
 
-Development (hot reload; UI on :5173 proxying to the API on :4680):
+On boot the console prints a **sign-in link**:
+
+```
+Sign-in  : http://127.0.0.1:4680/auth/<token>
+```
+
+Open that link once — it sets a local session cookie and redirects to the app.
+The token persists in `data/auth-token.txt`. Every `/api` request requires it
+(browser cookie or `Authorization: Bearer <token>`).
+
+## The repository-backed workflow
+
+1. **Projects → Register a local Git repository** (absolute path to the repo
+   root). Optionally configure validation commands (structured argv, no
+   shell) and protected paths.
+2. **＋ New task** → pick the repository project → describe the goal.
+3. **Dispatch** → an **exact approval grant** is created: bound to the task
+   goal, worker, repository, and current base commit; single-use; expires in
+   30 minutes. If the repo moves or the task changes, the grant is void.
+4. **Approve** → the Command Center atomically consumes the grant, takes
+   task/worker/repo **leases**, creates branch `cc/<attemptId>` and an
+   isolated worktree under `data/worktrees/`, and starts the worker there.
+5. The worker runs (Codex CLI, or the deterministic test runner); events
+   stream live; cancel kills the whole process tree.
+6. The Command Center captures the **actual git diff**, checks **protected
+   paths**, then **independently runs your validation commands** in the
+   worktree. No commands configured → the delivery is **UNVERIFIED** (never
+   silently "passed"); a required failure → **FAILED**.
+7. **Review**: real changed files, unified diff, validation results, worker
+   log tail. Accept (branch stays unmerged for you to merge when you choose),
+   request correction (retry = new grant + new attempt), or cancel. Clean up
+   the worktree explicitly; the branch is always kept.
+
+After a crash/restart, interrupted attempts are reconciled — a running worker
+becomes `unknown_outcome` (never blindly retried), interrupted validation
+becomes `blocked_reconciliation` with a one-click "re-run validation only".
+
+### Codex readiness
+
+The Codex path shells out to your locally installed, logged-in `codex` CLI
+(`codex exec --json`, workspace-write sandbox, prompt via stdin, no shell
+composition). Until you run an authenticated smoke test on your machine it is
+honestly labeled experimental; auth/rate-limit/quota failures are classified
+and surface as blocked attempts. To demo the full workflow without Codex
+credentials, start with `ATTEMPT_RUNNER=test`.
+
+## Configuration
+
+| Variable        | Default                    | Meaning                                        |
+| --------------- | -------------------------- | ---------------------------------------------- |
+| `HOST` / `PORT` | `127.0.0.1` / `4680`       | non-loopback refuses to start without `AUTH_TOKEN` |
+| `AUTH_TOKEN`    | *(generated)*              | overrides the token file                       |
+| `DATA_DIR`      | `./data`                   | database, worktrees, token                     |
+| `ATTEMPT_RUNNER`| `codex`                    | `test` = deterministic local runner            |
+| `CODEX_CLI` / `CODEX_MODEL` | `codex` / *(unset)* | executable + optional model allowlist  |
+| `ATTEMPT_TIMEOUT_MS` | `900000`              | hard cap per worker run                        |
+| `APPROVAL_TTL_MS` | `1800000`               | start-grant validity                           |
+| `SIM_SPEED`     | `1`                        | demo simulation pacing                         |
+
+## Testing
 
 ```bash
-npm run dev
+npm test              # 60 tests: unit + API + full vertical-slice integration
+npm run typecheck
+npm run build
 ```
 
-Useful environment variables:
+The integration suite registers throwaway git repositories and drives the
+entire workflow (register → grant → worktree → real change → real diff →
+independent validation → delivery) with the deterministic test runner, and
+covers double-approval, lease conflicts, grant expiry/invalidation,
+cancellation with process-tree kill, protected paths, secret redaction, and
+restart reconciliation. CI (GitHub Actions) runs on Ubuntu and Windows.
 
-| Variable       | Default                    | Meaning                                          |
-| -------------- | -------------------------- | ------------------------------------------------ |
-| `PORT`         | `4680`                     | API/UI port                                      |
-| `DATA_FILE`    | `data/command-center.json` | where state is persisted                         |
-| `SIM_SPEED`    | `1`                        | simulation pacing multiplier (2 = 2× fast)       |
-| `REAL_ADAPTERS`| `1`                        | set `0` to force all workers simulated           |
-| `CLAUDE_CLI`   | `claude`                   | Claude Code CLI command                          |
-| `CODEX_CLI`    | `codex`                    | Codex CLI command                                |
-| `CODEX_MODEL`  | *(unset)*                  | Codex model override (else the account default)  |
-| `ANTIGRAVITY_CLI` | `agy`                   | Antigravity CLI command (or full path)           |
-| `ANTIGRAVITY_MODEL` | *(unset)*             | Antigravity model override                        |
-| `ANTIGRAVITY_SKIP_PERMISSIONS` | `1`          | `0` = don't auto-approve tools (edits blocked)   |
+## Persistence & data
 
-First launch seeds three sample projects, four workers, and a small history
-so the product is demonstrable immediately. Delete `data/` to start fresh.
+SQLite (WAL) at `data/command-center.db` is the single authoritative store
+(projects, tasks, attempts, operations, leases, approvals, events, handoffs).
+A pre-existing `data/command-center.json` from v0.2 is imported once and left
+untouched. Back up by copying the `.db` file while the app is stopped.
 
-## Try the full scenario (2 minutes)
+## Security boundaries
 
-1. **＋ New task** → type
-   `Urgent: migrate the Games Project save-data schema so player progress can sync across devices`
-   → **Structure it** → review the draft (high risk, P0, Claude Code
-   recommended with reasons) → **Create task**.
-2. **▶ Dispatch worker** → a start approval appears → **Approve**.
-3. Watch the run: plan checklist, progress, live logs.
-4. The worker pauses itself at a **mid-run gate** (guarded schema change) →
-   **Approve**.
-5. Attempt 1 hits a realistic **blocker** → **Retry (attempt 2)** (or hand
-   off to another worker).
-6. Verification passes → task enters **Review** with the full evidence
-   package → **Approve** to accept delivery. Done.
-
-Scenario rules (by design, so every path is demonstrable):
-low risk → clean run · medium/high risk → one blocker on attempt 1 ·
-high risk → an additional mid-run approval gate.
-
-## Testing & checks
-
-```bash
-npm test              # 28 unit + API integration tests (vitest + supertest)
-npm run typecheck     # strict TS on server and client
-npm run build         # production build
-```
-
-The integration tests drive the complete lifecycle over the real HTTP API,
-including the mid-run gate, blocker, retry, handoff, pause/cancel, illegal
-transitions, and crash recovery.
-
-## Project structure
-
-```
-shared/types.ts         single source of truth for the domain model
-server/
-  src/domain/           intake parser, routing engine, lifecycle, handoff
-  src/store/            JSON persistence (atomic writes) + seed data
-  src/engine/           orchestrator + worker adapters (simulated today)
-  src/api/              REST routes + SSE stream
-  test/                 vitest suites
-client/
-  src/lib/              API client, SSE-fed live store, formatting
-  src/components/       cards, badges, timeline, log console, evidence panel
-  src/views/            Overview · Board · Task detail · Workers · Approvals · Activity
-docs/ARCHITECTURE.md    architecture, data model, lifecycle, adapter design
-```
-
-## Security posture
-
-- Runs entirely on `localhost`; no telemetry, no outbound calls.
-- No secrets anywhere in the codebase or config.
-- Simulated workers cannot touch the filesystem outside the app's own data
-  file; a future real adapter is designed to run in isolated workspaces with
-  owner approval gates (see architecture doc).
-
-## The real workers (Claude Code & Codex)
-
-At boot the server probes for each supported CLI (`claude --version`,
-`codex --version`, retried so a transient miss doesn't misfire). When found,
-the matching worker is upgraded to its **real adapter** (green `REAL ·
-claude-code` / `REAL · codex` badge; otherwise it stays simulated and says
-so). Every real run:
-
-1. creates an isolated workspace under `data/workspaces/<taskId>/` — never a
-   real repository checkout;
-2. writes a task brief and spawns the CLI headless with a hard timeout;
-3. streams the live session (commentary, tool calls, commands) into the
-   task's log console over SSE;
-4. computes evidence by **diffing real workspace snapshots** — file changes
-   in the delivery are what actually happened on disk, never model claims;
-5. reports honestly: no automated test gate in v1, so acceptance criteria
-   stay unjudged and the delivery review says "inspect the files yourself".
-
-Adapter differences (a deliberate capability contrast):
-
-| | Claude Code | Codex | Antigravity |
-|---|---|---|---|
-| Command | `claude -p --output-format stream-json` | `codex exec --json` | `agy --print` (plain text) |
-| Tools | file tools only — no shell | `--sandbox workspace-write` — may run shell | sandboxed shell + edits (see below) |
-| Login | `claude /login` | `codex login` | Antigravity app login |
-| Model | account default | account default; `CODEX_MODEL` | account default; `ANTIGRAVITY_MODEL` |
-
-Requirements: each CLI must be logged in once (owner action). Real CLI runs
-cannot be paused (the UI hides the button; the API refuses with a clear
-message) — cancel or let them finish. Sessions use your local
-subscription and incur normal usage. On Windows without WSL, Codex's
-OS-level sandbox enforcement may be limited; the `--cd` workspace boundary
-still applies.
-
-**Antigravity note:** the `agy` CLI cannot edit files in headless (`--print`)
-mode unless tool permissions are auto-approved — it otherwise auto-denies and
-does nothing. The adapter therefore runs with `--sandbox` (terminal
-restrictions) **and** `--dangerously-skip-permissions`, confined to the
-isolated workspace, and only after the owner approved the run in the Command
-Center. This is broader than the Claude Code adapter (which is file-tools
-only); set `ANTIGRAVITY_SKIP_PERMISSIONS=0` to disable it (runs will then
-block with an actionable message instead of editing). If `agy` is not on
-`PATH`, point `ANTIGRAVITY_CLI` at the binary (or run `agy install`).
+- Loopback-only bind; local token auth on every API call; origin check on
+  mutating requests; request-size limits; runtime schema validation (zod);
+  no stack traces or secrets in responses; conservative security headers.
+- Git and worker processes are spawned with **argument arrays only** — no
+  `shell: true` anywhere in the execution path; validation commands are
+  argv-allowlisted at registration.
+- Worker/validation subprocess env is stripped of `AUTH_TOKEN` and API keys;
+  logs are secret-redacted before storage/display.
+- Attempts are confined to `data/worktrees/<attemptId>` (containment-checked
+  against symlink/junction escape); registered repos must be real git roots
+  outside the app's data directory; protected paths are enforced on the diff.
+- No merge, no push, no LAN exposure, no telemetry.
 
 ## Known limitations
 
-- Codex / Antigravity / Hermes execution is simulated; their file diffs and
-  test counts in evidence are illustrative artifacts (labeled as such).
-- Real Claude Code runs don't execute tests yet (Bash is disabled by
-  design in v1); the owner reviews the workspace files before accepting.
-- Single owner, no auth — by design for a personal local tool.
-- JSON-file persistence is perfect for one user but not concurrent writers;
-  the store API is repository-shaped so SQLite can replace it without
-  touching callers.
-- Board is click-through (no drag-and-drop yet).
-- The intake parser is keyword-heuristic; it's intentionally behind the same
-  signature an LLM-backed parser would use.
+- The real-Codex path awaits an authenticated smoke test on this machine
+  (blocked only on owner credentials); all machinery is exercised by the
+  deterministic runner.
+- One repo-wide write lease per project (no finer-grained scopes yet).
+- Reassignment/handoff is not available for repository attempts (retry with
+  a new grant instead); it remains available on the simulated demo path.
+- Grant consumption re-reads repo HEAD just before the transaction; an
+  extremely narrow race with a concurrent local commit remains (documented).
+- The legacy workspace adapters (v0.2 demo path) still use their original
+  spawn strategy; they are demo-only and slated for migration onto the
+  attempt pipeline.
 
 ## Next milestone
 
-Harden the real adapter: opt-in verification commands (run the workspace's
-test suite in a sandboxed step with its output attached to evidence), real
-mid-run approval hooks via permission prompts, and a second real adapter
-(local model over HTTP for Hermes).
+Authenticated Codex smoke test + first-class multi-attempt review UX:
+attempt history list per task, diff-vs-diff comparison between attempts, and
+optional per-path write scopes so independent attempts on disjoint areas of
+one repository can run concurrently.

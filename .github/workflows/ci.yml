@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'improve/**']
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (server + client)
+        run: npm run typecheck
+
+      # tests create throwaway git repos; give git an identity
+      - name: Configure git for tests
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+
+      - name: Server tests (unit + integration, deterministic test runner)
+        run: npm test
+
+      - name: Build client
+        run: npm run build
