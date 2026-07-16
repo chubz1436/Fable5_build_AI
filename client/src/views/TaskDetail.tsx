@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import type { EventRecord, Task } from '../../../shared/types';
+import type { EventRecord, OperationRecord, Task } from '../../../shared/types';
 import { ApprovalCard } from '../components/ApprovalCard';
+import { AttemptEvidence, AttemptPanel } from '../components/AttemptPanel';
 import { EvidencePanel } from '../components/EvidencePanel';
 import { LogConsole, Timeline } from '../components/Timeline';
 import {
@@ -23,23 +24,29 @@ export function TaskDetail() {
   const { workerById } = useLookups();
 
   const [historicEvents, setHistoricEvents] = useState<EventRecord[]>([]);
+  const [operations, setOperations] = useState<OperationRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reassignTo, setReassignTo] = useState('');
   const [dispatchTo, setDispatchTo] = useState('');
 
   const task: Task | undefined = store.tasks.find((t) => t.id === id);
+  const taskStatus = task?.status;
 
   useEffect(() => {
     let gone = false;
     api
       .taskDetail(id)
-      .then((d) => !gone && setHistoricEvents(d.events))
+      .then((d) => {
+        if (gone) return;
+        setHistoricEvents(d.events);
+        setOperations(d.operations);
+      })
       .catch((e) => !gone && setError((e as Error).message));
     return () => {
       gone = true;
     };
-  }, [id]);
+  }, [id, taskStatus]);
 
   /** historic (oldest-first) + live events that arrived after bootstrap */
   const events = useMemo(() => {
@@ -51,6 +58,8 @@ export function TaskDetail() {
   const approvals = store.approvals.filter((a) => a.taskId === id);
   const pendingApprovals = approvals.filter((a) => a.status === 'pending');
   const handoffs = store.handoffs.filter((h) => h.taskId === id);
+  const taskAttempts = store.attempts.filter((a) => a.taskId === id);
+  const latestAttempt = taskAttempts[taskAttempts.length - 1];
 
   if (!store.loaded) return <EmptyState>Loading…</EmptyState>;
   if (!task) {
@@ -129,6 +138,7 @@ export function TaskDetail() {
             </>
           )}
           {task.status === 'running' &&
+            !task.gitProjectId &&
             workerById(task.assignedWorkerId)?.adapter === 'simulated' && (
               <button className="btn warning" disabled={busy} onClick={act(() => api.pause(task.id))}>
                 ⏸ Pause
@@ -144,7 +154,7 @@ export function TaskDetail() {
               ↻ Retry (attempt {task.attempts + 1})
             </button>
           )}
-          {['blocked', 'paused'].includes(task.status) && idleWorkers.length > 0 && (
+          {['blocked', 'paused'].includes(task.status) && !task.gitProjectId && idleWorkers.length > 0 && (
             <>
               <select
                 className="note-input"
@@ -202,7 +212,9 @@ export function TaskDetail() {
 
       <div className="grid two-col">
         <div className="grid" style={{ gap: 14 }}>
-          {(task.status === 'review' || task.status === 'completed') && task.evidence ? (
+          {task.gitProjectId && latestAttempt?.evidence ? (
+            <AttemptEvidence attempt={latestAttempt} />
+          ) : (task.status === 'review' || task.status === 'completed') && task.evidence ? (
             <EvidencePanel evidence={task.evidence} />
           ) : (
             <div className="card">
@@ -252,6 +264,9 @@ export function TaskDetail() {
         </div>
 
         <div className="grid" style={{ gap: 14 }}>
+          {task.gitProjectId && latestAttempt && (
+            <AttemptPanel attempt={latestAttempt} operations={operations} />
+          )}
           {task.recommendation && (
             <div className="card">
               <h3>Routing decision</h3>

@@ -6,13 +6,32 @@ import { Activity } from './views/Activity';
 import { Approvals } from './views/Approvals';
 import { Board } from './views/Board';
 import { Dashboard } from './views/Dashboard';
+import { Projects } from './views/Projects';
 import { TaskDetail } from './views/TaskDetail';
 import { Workers } from './views/Workers';
 
 export default function App() {
-  const { approvals, connected, system } = useStore();
+  const { approvals, authRequired, connected, system } = useStore();
   const [showNewTask, setShowNewTask] = useState(false);
   const pendingCount = approvals.filter((a) => a.status === 'pending').length;
+
+  if (authRequired) {
+    return (
+      <div className="modal-overlay" style={{ position: 'fixed' }}>
+        <div className="modal" style={{ maxWidth: 480 }}>
+          <h2>Sign in required</h2>
+          <p className="small">
+            This Command Center is protected by a local access token. Open the <b>sign-in link</b> printed
+            in the server console (it looks like <span className="mono">http://127.0.0.1:4680/auth/&lt;token&gt;</span>),
+            then reload this page.
+          </p>
+          <p className="small faint" style={{ margin: 0 }}>
+            The token lives in <span className="mono">data/auth-token.txt</span> next to the database.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="shell">
@@ -31,6 +50,9 @@ export default function App() {
           </NavLink>
           <NavLink to="/board">
             <span className="icon">▦</span> Board
+          </NavLink>
+          <NavLink to="/projects">
+            <span className="icon">⛁</span> Projects
           </NavLink>
           <NavLink to="/workers">
             <span className="icon">☰</span> Workers
@@ -67,6 +89,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Dashboard onNewTask={() => setShowNewTask(true)} />} />
           <Route path="/board" element={<Board onNewTask={() => setShowNewTask(true)} />} />
+          <Route path="/projects" element={<Projects />} />
           <Route path="/tasks/:id" element={<TaskDetail />} />
           <Route path="/workers" element={<Workers />} />
           <Route path="/approvals" element={<Approvals />} />

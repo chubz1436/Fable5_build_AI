@@ -37,6 +37,16 @@ export function Workers() {
                 <span className={`badge ${w.integration === 'real' ? 'b-success' : 'b-outline'}`}>
                   {w.integration === 'real' ? `REAL · ${w.adapter}` : `adapter: ${w.adapter}`}
                 </span>
+                {w.readiness && (
+                  <span
+                    className={`badge ${
+                      w.readiness.state === 'READY' ? 'b-success' : w.readiness.state === 'UNAVAILABLE' ? 'b-neutral' : 'b-warning'
+                    }`}
+                    title={w.readiness.lastError ?? `auth: ${w.readiness.authStatus}`}
+                  >
+                    {w.readiness.state}
+                  </span>
+                )}
               </div>
               <div>
                 <div className="small faint" style={{ marginBottom: 4 }}>Strengths</div>

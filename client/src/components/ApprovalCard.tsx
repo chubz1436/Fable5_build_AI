@@ -65,6 +65,18 @@ export function ApprovalCard({ approval }: { approval: Approval }) {
       <p className="small" style={{ margin: 0 }}>{approval.description}</p>
 
       <dl className="kv">
+        {approval.baseCommit && (
+          <>
+            <dt>Base commit</dt>
+            <dd className="mono small">{approval.baseCommit.slice(0, 12)} (grant is void if the repo moves)</dd>
+          </>
+        )}
+        {approval.expiresAt && approval.status === 'pending' && (
+          <>
+            <dt>Expires</dt>
+            <dd className="small">{new Date(approval.expiresAt).toLocaleTimeString()}{approval.singleUse ? ' · single-use' : ''}</dd>
+          </>
+        )}
         <dt>Affected scope</dt>
         <dd className="mono small">{approval.affectedScope.join(', ') || '—'}</dd>
         <dt>Recommendation</dt>

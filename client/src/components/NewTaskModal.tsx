@@ -97,7 +97,9 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
                   onChange={(e) => setDraft({ ...draft, projectId: e.target.value })}
                 >
                   {projects.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
+                    <option key={p.id} value={p.id}>
+                      {p.kind === 'git' ? `⛁ ${p.name} — repository (real execution)` : `${p.name} (simulated demo)`}
+                    </option>
                   ))}
                 </select>
               </div>
