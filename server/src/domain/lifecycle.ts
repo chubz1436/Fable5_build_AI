@@ -17,7 +17,9 @@ const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   awaiting_approval: ['running', 'ready', 'cancelled'],
   running: ['paused', 'blocked', 'verifying', 'cancelled', 'failed'],
   paused: ['running', 'blocked', 'cancelled'],
-  blocked: ['running', 'ready', 'cancelled', 'failed'],
+  // blocked → review covers restart-recovered attempts whose re-validation
+  // completes without re-running the worker
+  blocked: ['running', 'ready', 'review', 'cancelled', 'failed'],
   verifying: ['review', 'blocked', 'cancelled'],
   review: ['completed', 'blocked', 'cancelled'],
   completed: [],

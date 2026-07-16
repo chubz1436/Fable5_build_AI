@@ -2,6 +2,7 @@ import express, { type Express, type NextFunction, type Request, type Response }
 import fs from 'node:fs';
 import path from 'node:path';
 import type { SystemStatus } from '../../shared/types';
+import { AttemptService } from './attempts/service';
 import { loadConfig, repoRoot, type AppConfig } from './config';
 import { Db, importLegacyJson } from './db/db';
 import { Engine } from './engine/engine';
@@ -24,6 +25,7 @@ export interface AppContext {
   db: Db;
   store: Store;
   engine: Engine;
+  attempts: AttemptService;
   auth: AuthContext;
   authToken: string;
   startedAt: string;
@@ -37,7 +39,11 @@ export function createContext(overrides: Partial<AppConfig> = {}): AppContext {
   const store = new Store(db);
   seedIfEmpty(store);
   const engine = new Engine(store, config);
-  if (config.recoverOnBoot) engine.recoverInterrupted();
+  const attempts = new AttemptService(store, config);
+  if (config.recoverOnBoot) {
+    engine.recoverInterrupted();
+    void attempts.recover().catch((err) => console.error('attempt recovery failed:', err));
+  }
   const authToken = resolveAuthToken(config);
   const auth = buildAuthContext(config, authToken);
   const startedAt = nowIso();
@@ -47,6 +53,7 @@ export function createContext(overrides: Partial<AppConfig> = {}): AppContext {
     db,
     store,
     engine,
+    attempts,
     auth,
     authToken,
     startedAt,

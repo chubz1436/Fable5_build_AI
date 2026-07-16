@@ -86,5 +86,5 @@ export function makeTempGitRepo(files: Record<string, string> = { 'README.md': '
   }
   git('add', '-A');
   git('commit', '-m', 'initial commit');
-  return fs.realpathSync(dir);
+  return fs.realpathSync.native(dir);
 }

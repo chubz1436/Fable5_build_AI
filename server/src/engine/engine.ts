@@ -680,6 +680,7 @@ export class Engine {
    */
   recoverInterrupted(): void {
     for (const task of this.store.tasks) {
+      if (task.gitProjectId) continue; // git-backed tasks are reconciled by AttemptService
       if (['running', 'verifying', 'paused'].includes(task.status)) {
         task.status = 'blocked';
         task.blockReason = 'Execution was interrupted by a Command Center restart — retry to resume.';
@@ -746,6 +747,18 @@ export async function enableRealAdapters(store: Store, config: AppConfig): Promi
         worker.adapter = probe.adapter;
         worker.integration = 'real';
         worker.model = `${probe.label} (${version})`;
+        // P0.12: honest readiness — version is verified; auth is unknown
+        // until a real run proves it either way.
+        worker.readiness = {
+          state: 'READY',
+          executablePath: null,
+          version,
+          authStatus: 'unknown',
+          lastCheckAt: nowIso(),
+          lastError: null,
+          supportsCancel: true,
+          sandbox: probe.adapter === 'codex' ? 'workspace-write' : 'file-tools-only',
+        };
         store.upsertWorker(worker);
         store.addEvent({
           type: 'system.adapter',
@@ -758,6 +771,16 @@ export async function enableRealAdapters(store: Store, config: AppConfig): Promi
       worker.adapter = 'simulated';
       worker.integration = 'simulated';
       worker.model = probe.simulatedModel;
+      worker.readiness = {
+        state: 'UNAVAILABLE',
+        executablePath: null,
+        version: null,
+        authStatus: 'unknown',
+        lastCheckAt: nowIso(),
+        lastError: `${probe.label} not found on PATH`,
+        supportsCancel: false,
+        sandbox: null,
+      };
       store.upsertWorker(worker);
       store.addEvent({
         type: 'system.adapter',
