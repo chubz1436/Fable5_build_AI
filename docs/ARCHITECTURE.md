@@ -173,18 +173,30 @@ guessing the exact event schema), and nested Codex error shapes are
 flattened to a readable message. An optional `CODEX_MODEL` selects the model
 when the account default is unsuitable.
 
-Honesty guarantees (both real adapters): `RunResult.checks` may contain only
+**`AntigravityAdapter`** (`adapters/antigravity.ts`) drives the Antigravity
+CLI (`agy --print`), which returns a PLAIN-TEXT response (no JSON stream), so
+the adapter streams stdout lines straight into the log and reads the fenced
+json report from the accumulated text. `agy` cannot edit files in headless
+mode unless permissions are auto-approved, so the adapter runs `--sandbox`
+(terminal restrictions) **plus** `--dangerously-skip-permissions`, confined
+to the workspace via cwd + `--add-dir`. This is broader than the file-only
+Claude Code adapter; it is gated by the owner's start-approval and is
+disableable via `ANTIGRAVITY_SKIP_PERMISSIONS=0` (runs then block with an
+actionable message instead of silently doing nothing). The full brief is
+written to `_TASK_BRIEF.md` and referenced by a short, fixed prompt so no
+task text is interpolated into the shell command line.
+
+Honesty guarantees (all real adapters): `RunResult.checks` may contain only
 checks that actually ran, and `criteriaMet: null` leaves acceptance criteria
 unjudged so the delivery review tells the owner to inspect the files. Real
 processes can't be paused portably, so the adapters declare
 `capabilities.pause = false` and the engine refuses pause requests with a
 clear message.
 
-Requirements: one-time login by the owner (`claude /login`, `codex login`).
-**Antigravity** has no headless CLI today, so it is intentionally not in the
-probe table and stays simulated. Adding another real adapter (a Gemini/
-Antigravity CLI if one ships, or a local model over HTTP for Hermes) follows
-the same recipe; nothing in the engine, API, store, or UI changes.
+Requirements: one-time login by the owner (`claude /login`, `codex login`,
+Antigravity app login). Only **Hermes** remains simulated (no local CLI);
+adding a real adapter for it (a local model over HTTP) follows the same
+recipe — nothing in the engine, API, store, or UI changes.
 
 ## API surface
 
@@ -226,13 +238,13 @@ behind the same methods.
 
 ## Simulated vs real, precisely
 
-| Real and working                                              | Simulated                                        |
-| -------------------------------------------------------------- | ------------------------------------------------ |
-| Intake parsing (rule-based, local)                             | Antigravity / Hermes execution                   |
-| Routing engine + explanations                                  | Their file changes & test counts in evidence     |
-| Lifecycle state machine + approvals                            | Their blockers (injected by scenario rules)      |
-| **Claude Code & Codex workers: real CLI sessions, real diffs** | Automated test gate for real runs (none in v1)   |
-| SSE live updates, pause/resume/cancel                          |                                                  |
-| Retry/reassign + structured handoffs                           |                                                  |
-| Persistence, crash recovery, audit log                         |                                                  |
-| Full REST API + tests (incl. fake-CLI adapter suites)          |                                                  |
+| Real and working                                                       | Simulated                                       |
+| ----------------------------------------------------------------------- | ----------------------------------------------- |
+| Intake parsing (rule-based, local)                                      | Hermes execution                                |
+| Routing engine + explanations                                           | Its file changes & test counts in evidence      |
+| Lifecycle state machine + approvals                                     | Its blockers (injected by scenario rules)       |
+| **Claude Code, Codex & Antigravity: real CLI sessions, real diffs**     | Automated test gate for real runs (none in v1)  |
+| SSE live updates, pause/resume/cancel                                   |                                                 |
+| Retry/reassign + structured handoffs                                    |                                                 |
+| Persistence, crash recovery, audit log                                  |                                                 |
+| Full REST API + tests (incl. fake-CLI adapter suites)                   |                                                 |

@@ -13,6 +13,7 @@ import { recommendWorker } from '../domain/recommend';
 import { nowIso, uid } from '../domain/util';
 import path from 'node:path';
 import type { Store } from '../store/store';
+import { AntigravityAdapter } from './adapters/antigravity';
 import { ClaudeCodeAdapter } from './adapters/claude-code';
 import { detectCli } from './adapters/cli-common';
 import { CodexAdapter } from './adapters/codex';
@@ -52,6 +53,16 @@ export class Engine {
         timeoutMs: config.codexTimeoutMs,
         workspaceRoot,
         model: config.codexModel,
+      }),
+    );
+    this.adapters.set(
+      'antigravity',
+      new AntigravityAdapter({
+        command: config.antigravityCommand,
+        timeoutMs: config.antigravityTimeoutMs,
+        workspaceRoot,
+        model: config.antigravityModel,
+        skipPermissions: config.antigravitySkipPermissions,
       }),
     );
   }
@@ -691,7 +702,7 @@ export class NotFoundError extends Error {
 export async function enableRealAdapters(store: Store, config: AppConfig): Promise<void> {
   const probes: Array<{
     workerId: string;
-    adapter: 'claude-code' | 'codex';
+    adapter: 'claude-code' | 'codex' | 'antigravity';
     command: string;
     label: string;
     /** model string to restore if the CLI is not present (revert case) */
@@ -699,6 +710,7 @@ export async function enableRealAdapters(store: Store, config: AppConfig): Promi
   }> = [
     { workerId: 'wkr_claude_code', adapter: 'claude-code', command: config.claudeCommand, label: 'Claude Code CLI', simulatedModel: 'claude-fable-5' },
     { workerId: 'wkr_codex', adapter: 'codex', command: config.codexCommand, label: 'Codex CLI', simulatedModel: 'gpt-5-codex' },
+    { workerId: 'wkr_antigravity', adapter: 'antigravity', command: config.antigravityCommand, label: 'Antigravity CLI', simulatedModel: 'gemini-3-pro' },
   ];
 
   for (const probe of probes) {

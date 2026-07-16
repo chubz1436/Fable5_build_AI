@@ -27,6 +27,17 @@ export interface AppConfig {
   codexTimeoutMs: number;
   /** optional Codex model override; empty = respect the user's codex config */
   codexModel: string;
+  /** command used to launch the Antigravity CLI (tests substitute a fake) */
+  antigravityCommand: string;
+  antigravityTimeoutMs: number;
+  antigravityModel: string;
+  /**
+   * Auto-approve tool permissions so the Antigravity CLI can edit files
+   * headless. Required for it to do work; the run is still confined to an
+   * isolated sandboxed workspace and gated by owner approval. Set
+   * ANTIGRAVITY_SKIP_PERMISSIONS=0 to disable.
+   */
+  antigravitySkipPermissions: boolean;
 }
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -43,6 +54,10 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     codexCommand: process.env.CODEX_CLI ?? 'codex',
     codexTimeoutMs: Number(process.env.CODEX_TIMEOUT_MS ?? 600_000),
     codexModel: process.env.CODEX_MODEL ?? '',
+    antigravityCommand: process.env.ANTIGRAVITY_CLI ?? 'agy',
+    antigravityTimeoutMs: Number(process.env.ANTIGRAVITY_TIMEOUT_MS ?? 600_000),
+    antigravityModel: process.env.ANTIGRAVITY_MODEL ?? '',
+    antigravitySkipPermissions: process.env.ANTIGRAVITY_SKIP_PERMISSIONS !== '0',
     ...overrides,
   };
 }

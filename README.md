@@ -6,14 +6,15 @@ worker, approve the important moments, watch execution live, recover from
 blockers, and review hard evidence before accepting the delivery — instead of
 juggling separate apps and copy-pasting prompts.
 
-> **Honesty up front:** the Command Center is hybrid. The **Claude Code and
-> Codex workers are real** — when their CLIs are detected at boot, tasks
-> dispatched to them run actual headless CLI sessions in an isolated
+> **Honesty up front:** the Command Center is hybrid. **Claude Code, Codex,
+> and Antigravity are real adapters** — when their CLIs are detected at boot,
+> tasks dispatched to them run actual headless CLI sessions in an isolated
 > per-task workspace (each requires a one-time login on this machine:
-> `claude /login`, `codex login`). **Antigravity and Hermes** run on a
-> local, deterministic **simulation engine** — no external AI is called for
-> them and nothing pretends otherwise; the UI labels every worker's adapter
-> (`REAL · claude-code`, `REAL · codex`, or `adapter: simulated`).
+> `claude /login`, `codex login`, and the Antigravity app login for `agy`).
+> **Hermes** runs on a local, deterministic **simulation engine** — no
+> external AI is called for it and nothing pretends otherwise; the UI labels
+> every worker's adapter (`REAL · claude-code`, `REAL · codex`,
+> `REAL · antigravity`, or `adapter: simulated`).
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the adapter design.
 
 ![stack](https://img.shields.io/badge/stack-TypeScript%20%C2%B7%20Express%205%20%C2%B7%20React%2019%20%C2%B7%20Vite-8b7bff)
@@ -66,6 +67,9 @@ Useful environment variables:
 | `CLAUDE_CLI`   | `claude`                   | Claude Code CLI command                          |
 | `CODEX_CLI`    | `codex`                    | Codex CLI command                                |
 | `CODEX_MODEL`  | *(unset)*                  | Codex model override (else the account default)  |
+| `ANTIGRAVITY_CLI` | `agy`                   | Antigravity CLI command (or full path)           |
+| `ANTIGRAVITY_MODEL` | *(unset)*             | Antigravity model override                        |
+| `ANTIGRAVITY_SKIP_PERMISSIONS` | `1`          | `0` = don't auto-approve tools (edits blocked)   |
 
 First launch seeds three sample projects, four workers, and a small history
 so the product is demonstrable immediately. Delete `data/` to start fresh.
@@ -146,20 +150,29 @@ so). Every real run:
 
 Adapter differences (a deliberate capability contrast):
 
-| | Claude Code | Codex |
-|---|---|---|
-| Command | `claude -p --output-format stream-json` | `codex exec --json` |
-| Tools | file tools only (`Write/Edit/Read/Glob/Grep`) — no shell | `--sandbox workspace-write` — **may run shell commands**, writes confined to the workspace |
-| Login | `claude /login` | `codex login` |
-| Model | account default | account default; override with `CODEX_MODEL` |
+| | Claude Code | Codex | Antigravity |
+|---|---|---|---|
+| Command | `claude -p --output-format stream-json` | `codex exec --json` | `agy --print` (plain text) |
+| Tools | file tools only — no shell | `--sandbox workspace-write` — may run shell | sandboxed shell + edits (see below) |
+| Login | `claude /login` | `codex login` | Antigravity app login |
+| Model | account default | account default; `CODEX_MODEL` | account default; `ANTIGRAVITY_MODEL` |
 
 Requirements: each CLI must be logged in once (owner action). Real CLI runs
 cannot be paused (the UI hides the button; the API refuses with a clear
 message) — cancel or let them finish. Sessions use your local
 subscription and incur normal usage. On Windows without WSL, Codex's
 OS-level sandbox enforcement may be limited; the `--cd` workspace boundary
-still applies. **Antigravity** has no headless CLI, so it stays simulated;
-if a driver becomes available it plugs into the same adapter seam.
+still applies.
+
+**Antigravity note:** the `agy` CLI cannot edit files in headless (`--print`)
+mode unless tool permissions are auto-approved — it otherwise auto-denies and
+does nothing. The adapter therefore runs with `--sandbox` (terminal
+restrictions) **and** `--dangerously-skip-permissions`, confined to the
+isolated workspace, and only after the owner approved the run in the Command
+Center. This is broader than the Claude Code adapter (which is file-tools
+only); set `ANTIGRAVITY_SKIP_PERMISSIONS=0` to disable it (runs will then
+block with an actionable message instead of editing). If `agy` is not on
+`PATH`, point `ANTIGRAVITY_CLI` at the binary (or run `agy install`).
 
 ## Known limitations
 
