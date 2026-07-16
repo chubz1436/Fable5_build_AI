@@ -21,6 +21,7 @@ interface RunnerState {
  */
 export class SimulatedAdapter implements WorkerAdapter {
   readonly kind = 'simulated';
+  readonly capabilities = { pause: true };
   private runners = new Map<string, RunnerState>();
 
   start(ctx: RunContext): void {
@@ -251,6 +252,12 @@ export class SimulatedAdapter implements WorkerAdapter {
       ],
       limitations,
       confidence: Math.round((0.82 + rand() * 0.13) * 100) / 100,
+      checks: [
+        '[verify] type check … OK',
+        `[verify] test suite … ${tests.passed} passed, ${tests.failed} failed`,
+        '[verify] acceptance criteria … checked (simulated)',
+      ],
+      criteriaMet: true,
     };
   }
 

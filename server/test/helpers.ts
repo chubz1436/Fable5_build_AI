@@ -15,6 +15,7 @@ export function testContext(overrides: Record<string, unknown> = {}): {
     dataFile,
     simSpeed: 500,
     recoverOnBoot: false,
+    realAdapters: false, // tests never probe for local CLIs
     ...overrides,
   });
   return { ctx, app: createApp(ctx), dataFile };

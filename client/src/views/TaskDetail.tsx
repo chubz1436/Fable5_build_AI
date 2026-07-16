@@ -128,11 +128,12 @@ export function TaskDetail() {
               </select>
             </>
           )}
-          {task.status === 'running' && (
-            <button className="btn warning" disabled={busy} onClick={act(() => api.pause(task.id))}>
-              ⏸ Pause
-            </button>
-          )}
+          {task.status === 'running' &&
+            workerById(task.assignedWorkerId)?.adapter !== 'claude-code' && (
+              <button className="btn warning" disabled={busy} onClick={act(() => api.pause(task.id))}>
+                ⏸ Pause
+              </button>
+            )}
           {task.status === 'paused' && (
             <button className="btn primary" disabled={busy} onClick={act(() => api.resume(task.id))}>
               ▶ Resume

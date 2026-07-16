@@ -1,7 +1,14 @@
 import { createApp, createContext } from './app';
+import { enableRealAdapters } from './engine/engine';
 
 const ctx = createContext();
 const app = createApp(ctx);
+
+if (ctx.config.realAdapters) {
+  void enableRealAdapters(ctx.store, ctx.config).catch((err) =>
+    console.error('real-adapter detection failed:', err),
+  );
+}
 
 const server = app.listen(ctx.config.port, () => {
   console.log(`\n  CHUBZ AI Command Center`);

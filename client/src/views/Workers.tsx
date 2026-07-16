@@ -5,12 +5,17 @@ import { useLookups, useStore } from '../lib/store';
 export function Workers() {
   const { workers } = useStore();
   const { taskById } = useLookups();
+  const realCount = workers.filter((w) => w.integration === 'real').length;
   return (
     <>
       <div className="topbar">
         <h1>Worker roster</h1>
         <span className="spacer" />
-        <span className="badge b-outline">all execution is simulated — real adapters plug in later</span>
+        <span className={`badge ${realCount ? 'b-success' : 'b-outline'}`}>
+          {realCount
+            ? `${realCount} real adapter${realCount > 1 ? 's' : ''} active — others simulated`
+            : 'all execution is simulated — real adapters plug in later'}
+        </span>
       </div>
       <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}>
         {workers.map((w) => {
@@ -29,7 +34,9 @@ export function Workers() {
                 <span className={`badge dot ${AVAILABILITY_TONE[w.availability]}`}>{w.availability}</span>
                 <span className={`badge ${HEALTH_TONE[w.health]}`}>{w.health}</span>
                 <span className="badge b-outline">{w.completedTaskCount} completed</span>
-                <span className="badge b-outline">adapter: {w.adapter}</span>
+                <span className={`badge ${w.integration === 'real' ? 'b-success' : 'b-outline'}`}>
+                  {w.integration === 'real' ? `REAL · ${w.adapter}` : `adapter: ${w.adapter}`}
+                </span>
               </div>
               <div>
                 <div className="small faint" style={{ marginBottom: 4 }}>Strengths</div>

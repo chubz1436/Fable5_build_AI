@@ -32,10 +32,11 @@ export function createContext(overrides: Partial<AppConfig> = {}): AppContext {
     engine,
     startedAt,
     systemStatus(): SystemStatus {
+      const hasReal = store.workers.some((w) => w.integration === 'real');
       return {
         startedAt,
         version: config.version,
-        engine: 'simulated',
+        engine: hasReal ? 'simulated + claude-code' : 'simulated',
         simSpeed: config.simSpeed,
         dataFile: config.dataFile,
       };

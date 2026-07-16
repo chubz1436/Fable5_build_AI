@@ -18,6 +18,17 @@ export interface RunResult {
   limitations: string[];
   /** 0..1 self-assessed confidence */
   confidence: number;
+  /**
+   * Verification log lines the engine may emit. Adapters must only report
+   * checks that actually ran — the engine never invents its own.
+   */
+  checks: string[];
+  /**
+   * true  → automated verification covered the acceptance criteria;
+   * null  → no automated verification ran; the owner judges the criteria
+   *          during delivery review (real CLI runs use this).
+   */
+  criteriaMet: boolean | null;
 }
 
 /**
@@ -67,6 +78,12 @@ export interface RunContext {
  */
 export interface WorkerAdapter {
   readonly kind: string;
+  /**
+   * What this adapter can actually do. A real subprocess can't be paused
+   * portably, so the engine refuses pause requests when `pause` is false
+   * instead of pretending.
+   */
+  readonly capabilities: { pause: boolean };
   start(ctx: RunContext): void;
   pause(taskId: string): void;
   resume(taskId: string): void;

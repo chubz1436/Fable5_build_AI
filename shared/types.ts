@@ -62,13 +62,14 @@ export interface WorkerProfile {
   health: WorkerHealth;
   currentTaskId: string | null;
   /** which adapter drives this worker */
-  adapter: 'simulated';
+  adapter: 'simulated' | 'claude-code';
   /**
    * Honesty flag: 'simulated' means execution is produced by the local
-   * simulation engine; 'planned' marks a real integration designed but not
-   * yet wired up. Nothing in this app pretends a real integration works.
+   * simulation engine; 'real' means a live local integration (detected at
+   * boot); 'planned' marks a real integration designed but not yet wired
+   * up. Nothing in this app pretends a real integration works.
    */
-  integration: 'simulated' | 'planned';
+  integration: 'simulated' | 'real' | 'planned';
   completedTaskCount: number;
 }
 
@@ -230,7 +231,8 @@ export interface StateSnapshot {
 export interface SystemStatus {
   startedAt: string;
   version: string;
-  engine: 'simulated';
+  /** e.g. 'simulated' or 'simulated + claude-code' */
+  engine: string;
   simSpeed: number;
   dataFile: string;
 }

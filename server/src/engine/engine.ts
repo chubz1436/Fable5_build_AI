@@ -11,7 +11,9 @@ import { buildHandoff } from '../domain/handoff';
 import { assertTransition, LifecycleError, TERMINAL_STATUSES } from '../domain/lifecycle';
 import { recommendWorker } from '../domain/recommend';
 import { nowIso, uid } from '../domain/util';
+import path from 'node:path';
 import type { Store } from '../store/store';
+import { ClaudeCodeAdapter, detectClaudeCli } from './adapters/claude-code';
 import { SimulatedAdapter } from './adapters/simulated';
 import type { RunContext, RunResult, WorkerAdapter } from './adapters/types';
 
@@ -32,6 +34,14 @@ export class Engine {
     private readonly config: AppConfig,
   ) {
     this.adapters.set('simulated', new SimulatedAdapter());
+    this.adapters.set(
+      'claude-code',
+      new ClaudeCodeAdapter({
+        command: config.claudeCommand,
+        timeoutMs: config.claudeTimeoutMs,
+        workspaceRoot: path.join(path.dirname(config.dataFile), 'workspaces'),
+      }),
+    );
   }
 
   // -- helpers ----------------------------------------------------------------
@@ -212,6 +222,12 @@ export class Engine {
 
   pause(taskId: string): Task {
     const task = this.mustTask(taskId);
+    const activeWorker = task.assignedWorkerId ? this.store.worker(task.assignedWorkerId) : null;
+    if (activeWorker && !this.adapterFor(activeWorker).capabilities.pause) {
+      throw new LifecycleError(
+        `${activeWorker.name} runs a real CLI process that cannot be paused — cancel it or let it finish.`,
+      );
+    }
     assertTransition(task.status, 'paused');
     task.status = 'paused';
     this.store.upsertTask(task);
@@ -533,18 +549,20 @@ export class Engine {
     const check = (line: string) =>
       this.store.addEvent({ type: 'run.log', taskId, workerId, message: line });
 
-    await pace(700);
-    if (this.activeRuns.get(taskId) !== attempt) return;
-    check(`[verify] type check … OK`);
-    check(`[verify] test suite … ${result.tests.passed} passed, ${result.tests.failed} failed`);
-    await pace(700);
-    if (this.activeRuns.get(taskId) !== attempt) return;
-    check(`[verify] acceptance criteria … ${task.acceptanceCriteria.length} checked`);
+    // only report checks the adapter actually ran — nothing is invented here
+    for (const line of result.checks) {
+      await pace(500);
+      if (this.activeRuns.get(taskId) !== attempt) return;
+      check(line);
+    }
 
     const fresh = this.store.task(taskId);
     if (!fresh || this.activeRuns.get(taskId) !== attempt) return;
 
-    fresh.acceptanceCriteria = fresh.acceptanceCriteria.map((c) => ({ ...c, met: true }));
+    if (result.criteriaMet !== null) {
+      const met = result.criteriaMet;
+      fresh.acceptanceCriteria = fresh.acceptanceCriteria.map((c) => ({ ...c, met }));
+    }
     fresh.evidence = {
       request: fresh.goal,
       summary: result.summary,
@@ -569,7 +587,10 @@ export class Engine {
       type: 'verify.passed',
       level: 'success',
       taskId,
-      message: `Verification passed — evidence ready for review`,
+      message:
+        result.criteriaMet === null
+          ? 'Run finished — real evidence collected; owner review required'
+          : 'Verification passed — evidence ready for review',
     });
 
     const workerName = this.store.worker(workerId)?.name ?? 'Worker';
@@ -584,7 +605,10 @@ export class Engine {
       risk: fresh.risk,
       affectedScope: fresh.scope,
       recommendedAction: 'approve',
-      recommendationReason: `Verification passed and confidence is ${Math.round(result.confidence * 100)}%.`,
+      recommendationReason:
+        result.criteriaMet === null
+          ? `Real worker run finished (confidence ${Math.round(result.confidence * 100)}%) — no automated verification ran, so inspect the changed files yourself before accepting.`
+          : `Verification passed and confidence is ${Math.round(result.confidence * 100)}%.`,
       status: 'pending',
       createdAt: nowIso(),
       decidedAt: null,
@@ -643,4 +667,42 @@ export class Engine {
 
 export class NotFoundError extends Error {
   readonly statusCode = 404;
+}
+
+/**
+ * Boot-time honesty pass: probe for the Claude Code CLI and upgrade the
+ * Claude Code worker to the real adapter when it is actually available —
+ * or revert it to simulated when it is not. Runs only from the runtime
+ * entrypoint (never in tests).
+ */
+export async function enableRealAdapters(store: Store, config: AppConfig): Promise<void> {
+  const worker = store.worker('wkr_claude_code');
+  if (!worker) return;
+
+  const version = await detectClaudeCli(config.claudeCommand);
+  if (version) {
+    if (worker.adapter !== 'claude-code') {
+      worker.adapter = 'claude-code';
+      worker.integration = 'real';
+      worker.model = `Claude Code CLI (${version})`;
+      store.upsertWorker(worker);
+      store.addEvent({
+        type: 'system.adapter',
+        level: 'success',
+        workerId: worker.id,
+        message: `Claude Code CLI detected (${version}) — worker “${worker.name}” now uses the REAL adapter`,
+      });
+    }
+  } else if (worker.adapter === 'claude-code') {
+    worker.adapter = 'simulated';
+    worker.integration = 'simulated';
+    store.upsertWorker(worker);
+    store.addEvent({
+      type: 'system.adapter',
+      level: 'warning',
+      workerId: worker.id,
+      message: `Claude Code CLI not found on PATH — worker “${worker.name}” reverted to the simulated adapter`,
+    });
+  }
+  store.flushSync();
 }
