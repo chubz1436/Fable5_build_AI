@@ -62,7 +62,7 @@ export interface WorkerProfile {
   health: WorkerHealth;
   currentTaskId: string | null;
   /** which adapter drives this worker */
-  adapter: 'simulated' | 'claude-code';
+  adapter: 'simulated' | 'claude-code' | 'codex';
   /**
    * Honesty flag: 'simulated' means execution is produced by the local
    * simulation engine; 'real' means a live local integration (detected at

@@ -22,6 +22,11 @@ export interface AppConfig {
   claudeCommand: string;
   /** hard timeout for a single real CLI session */
   claudeTimeoutMs: number;
+  /** command used to launch the Codex CLI (tests substitute a fake) */
+  codexCommand: string;
+  codexTimeoutMs: number;
+  /** optional Codex model override; empty = respect the user's codex config */
+  codexModel: string;
 }
 
 export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
@@ -35,6 +40,9 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     realAdapters: process.env.REAL_ADAPTERS !== '0',
     claudeCommand: process.env.CLAUDE_CLI ?? 'claude',
     claudeTimeoutMs: Number(process.env.CLAUDE_TIMEOUT_MS ?? 600_000),
+    codexCommand: process.env.CODEX_CLI ?? 'codex',
+    codexTimeoutMs: Number(process.env.CODEX_TIMEOUT_MS ?? 600_000),
+    codexModel: process.env.CODEX_MODEL ?? '',
     ...overrides,
   };
 }

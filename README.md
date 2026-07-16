@@ -6,13 +6,14 @@ worker, approve the important moments, watch execution live, recover from
 blockers, and review hard evidence before accepting the delivery — instead of
 juggling separate apps and copy-pasting prompts.
 
-> **Honesty up front:** the Command Center is hybrid. The **Claude Code
-> worker is real** — when the Claude Code CLI is detected at boot, tasks
-> dispatched to it run an actual headless CLI session in an isolated
-> per-task workspace (requires a one-time `claude /login` on this machine).
-> All other workers (Codex, Antigravity, Hermes) run on a local,
-> deterministic **simulation engine** — no external AI is called for them
-> and nothing pretends otherwise; the UI labels every worker's adapter.
+> **Honesty up front:** the Command Center is hybrid. The **Claude Code and
+> Codex workers are real** — when their CLIs are detected at boot, tasks
+> dispatched to them run actual headless CLI sessions in an isolated
+> per-task workspace (each requires a one-time login on this machine:
+> `claude /login`, `codex login`). **Antigravity and Hermes** run on a
+> local, deterministic **simulation engine** — no external AI is called for
+> them and nothing pretends otherwise; the UI labels every worker's adapter
+> (`REAL · claude-code`, `REAL · codex`, or `adapter: simulated`).
 > See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the adapter design.
 
 ![stack](https://img.shields.io/badge/stack-TypeScript%20%C2%B7%20Express%205%20%C2%B7%20React%2019%20%C2%B7%20Vite-8b7bff)
@@ -56,11 +57,15 @@ npm run dev
 
 Useful environment variables:
 
-| Variable    | Default                    | Meaning                                   |
-| ----------- | -------------------------- | ----------------------------------------- |
-| `PORT`      | `4680`                     | API/UI port                               |
-| `DATA_FILE` | `data/command-center.json` | where state is persisted                  |
-| `SIM_SPEED` | `1`                        | simulation pacing multiplier (2 = 2× fast) |
+| Variable       | Default                    | Meaning                                          |
+| -------------- | -------------------------- | ------------------------------------------------ |
+| `PORT`         | `4680`                     | API/UI port                                      |
+| `DATA_FILE`    | `data/command-center.json` | where state is persisted                         |
+| `SIM_SPEED`    | `1`                        | simulation pacing multiplier (2 = 2× fast)       |
+| `REAL_ADAPTERS`| `1`                        | set `0` to force all workers simulated           |
+| `CLAUDE_CLI`   | `claude`                   | Claude Code CLI command                          |
+| `CODEX_CLI`    | `codex`                    | Codex CLI command                                |
+| `CODEX_MODEL`  | *(unset)*                  | Codex model override (else the account default)  |
 
 First launch seeds three sample projects, four workers, and a small history
 so the product is demonstrable immediately. Delete `data/` to start fresh.
@@ -121,29 +126,40 @@ docs/ARCHITECTURE.md    architecture, data model, lifecycle, adapter design
   file; a future real adapter is designed to run in isolated workspaces with
   owner approval gates (see architecture doc).
 
-## The real Claude Code worker
+## The real workers (Claude Code & Codex)
 
-At boot the server probes for the Claude Code CLI (`claude --version`).
-When found, the Claude Code worker is upgraded to the **real adapter**
-(green `REAL · claude-code` badge in the roster; otherwise it stays
-simulated and says so). A real run:
+At boot the server probes for each supported CLI (`claude --version`,
+`codex --version`, retried so a transient miss doesn't misfire). When found,
+the matching worker is upgraded to its **real adapter** (green `REAL ·
+claude-code` / `REAL · codex` badge; otherwise it stays simulated and says
+so). Every real run:
 
-1. creates an isolated workspace under `data/workspaces/<taskId>/` — never
-   a real repository checkout;
-2. writes a task brief and spawns `claude -p` headless with
-   `--permission-mode acceptEdits` and a **file-tools-only allowlist**
-   (no Bash, no network), plus a hard timeout;
-3. streams the live session (model, commentary, tool calls) into the task's
-   log console over SSE;
+1. creates an isolated workspace under `data/workspaces/<taskId>/` — never a
+   real repository checkout;
+2. writes a task brief and spawns the CLI headless with a hard timeout;
+3. streams the live session (commentary, tool calls, commands) into the
+   task's log console over SSE;
 4. computes evidence by **diffing real workspace snapshots** — file changes
    in the delivery are what actually happened on disk, never model claims;
-5. reports honestly: no automated tests run in v1, so acceptance criteria
+5. reports honestly: no automated test gate in v1, so acceptance criteria
    stay unjudged and the delivery review says "inspect the files yourself".
 
-Requirements: the CLI must be logged in once (`claude /login` in any
-terminal, owner action). Real CLI runs cannot be paused (the UI hides the
-button; the API refuses with a clear message) — cancel or let them finish.
-Sessions use your local Claude subscription and incur normal usage.
+Adapter differences (a deliberate capability contrast):
+
+| | Claude Code | Codex |
+|---|---|---|
+| Command | `claude -p --output-format stream-json` | `codex exec --json` |
+| Tools | file tools only (`Write/Edit/Read/Glob/Grep`) — no shell | `--sandbox workspace-write` — **may run shell commands**, writes confined to the workspace |
+| Login | `claude /login` | `codex login` |
+| Model | account default | account default; override with `CODEX_MODEL` |
+
+Requirements: each CLI must be logged in once (owner action). Real CLI runs
+cannot be paused (the UI hides the button; the API refuses with a clear
+message) — cancel or let them finish. Sessions use your local
+subscription and incur normal usage. On Windows without WSL, Codex's
+OS-level sandbox enforcement may be limited; the `--cd` workspace boundary
+still applies. **Antigravity** has no headless CLI, so it stays simulated;
+if a driver becomes available it plugs into the same adapter seam.
 
 ## Known limitations
 

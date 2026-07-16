@@ -13,7 +13,9 @@ import { recommendWorker } from '../domain/recommend';
 import { nowIso, uid } from '../domain/util';
 import path from 'node:path';
 import type { Store } from '../store/store';
-import { ClaudeCodeAdapter, detectClaudeCli } from './adapters/claude-code';
+import { ClaudeCodeAdapter } from './adapters/claude-code';
+import { detectCli } from './adapters/cli-common';
+import { CodexAdapter } from './adapters/codex';
 import { SimulatedAdapter } from './adapters/simulated';
 import type { RunContext, RunResult, WorkerAdapter } from './adapters/types';
 
@@ -33,13 +35,23 @@ export class Engine {
     private readonly store: Store,
     private readonly config: AppConfig,
   ) {
+    const workspaceRoot = path.join(path.dirname(config.dataFile), 'workspaces');
     this.adapters.set('simulated', new SimulatedAdapter());
     this.adapters.set(
       'claude-code',
       new ClaudeCodeAdapter({
         command: config.claudeCommand,
         timeoutMs: config.claudeTimeoutMs,
-        workspaceRoot: path.join(path.dirname(config.dataFile), 'workspaces'),
+        workspaceRoot,
+      }),
+    );
+    this.adapters.set(
+      'codex',
+      new CodexAdapter({
+        command: config.codexCommand,
+        timeoutMs: config.codexTimeoutMs,
+        workspaceRoot,
+        model: config.codexModel,
       }),
     );
   }
@@ -670,39 +682,54 @@ export class NotFoundError extends Error {
 }
 
 /**
- * Boot-time honesty pass: probe for the Claude Code CLI and upgrade the
- * Claude Code worker to the real adapter when it is actually available —
+ * Boot-time honesty pass: probe for each supported local CLI and upgrade the
+ * matching worker to its real adapter when the CLI is actually available —
  * or revert it to simulated when it is not. Runs only from the runtime
- * entrypoint (never in tests).
+ * entrypoint (never in tests). Antigravity has no headless CLI, so it is
+ * intentionally absent here and stays simulated.
  */
 export async function enableRealAdapters(store: Store, config: AppConfig): Promise<void> {
-  const worker = store.worker('wkr_claude_code');
-  if (!worker) return;
+  const probes: Array<{
+    workerId: string;
+    adapter: 'claude-code' | 'codex';
+    command: string;
+    label: string;
+    /** model string to restore if the CLI is not present (revert case) */
+    simulatedModel: string;
+  }> = [
+    { workerId: 'wkr_claude_code', adapter: 'claude-code', command: config.claudeCommand, label: 'Claude Code CLI', simulatedModel: 'claude-fable-5' },
+    { workerId: 'wkr_codex', adapter: 'codex', command: config.codexCommand, label: 'Codex CLI', simulatedModel: 'gpt-5-codex' },
+  ];
 
-  const version = await detectClaudeCli(config.claudeCommand);
-  if (version) {
-    if (worker.adapter !== 'claude-code') {
-      worker.adapter = 'claude-code';
-      worker.integration = 'real';
-      worker.model = `Claude Code CLI (${version})`;
+  for (const probe of probes) {
+    const worker = store.worker(probe.workerId);
+    if (!worker) continue;
+    const version = await detectCli(probe.command);
+    if (version) {
+      if (worker.adapter !== probe.adapter) {
+        worker.adapter = probe.adapter;
+        worker.integration = 'real';
+        worker.model = `${probe.label} (${version})`;
+        store.upsertWorker(worker);
+        store.addEvent({
+          type: 'system.adapter',
+          level: 'success',
+          workerId: worker.id,
+          message: `${probe.label} detected (${version}) — worker “${worker.name}” now uses the REAL adapter`,
+        });
+      }
+    } else if (worker.adapter === probe.adapter) {
+      worker.adapter = 'simulated';
+      worker.integration = 'simulated';
+      worker.model = probe.simulatedModel;
       store.upsertWorker(worker);
       store.addEvent({
         type: 'system.adapter',
-        level: 'success',
+        level: 'warning',
         workerId: worker.id,
-        message: `Claude Code CLI detected (${version}) — worker “${worker.name}” now uses the REAL adapter`,
+        message: `${probe.label} not found on PATH — worker “${worker.name}” reverted to the simulated adapter`,
       });
     }
-  } else if (worker.adapter === 'claude-code') {
-    worker.adapter = 'simulated';
-    worker.integration = 'simulated';
-    store.upsertWorker(worker);
-    store.addEvent({
-      type: 'system.adapter',
-      level: 'warning',
-      workerId: worker.id,
-      message: `Claude Code CLI not found on PATH — worker “${worker.name}” reverted to the simulated adapter`,
-    });
   }
   store.flushSync();
 }

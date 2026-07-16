@@ -129,7 +129,7 @@ export function TaskDetail() {
             </>
           )}
           {task.status === 'running' &&
-            workerById(task.assignedWorkerId)?.adapter !== 'claude-code' && (
+            workerById(task.assignedWorkerId)?.adapter === 'simulated' && (
               <button className="btn warning" disabled={busy} onClick={act(() => api.pause(task.id))}>
                 ⏸ Pause
               </button>

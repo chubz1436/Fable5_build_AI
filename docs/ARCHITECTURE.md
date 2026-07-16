@@ -132,13 +132,23 @@ between (and during) steps, and follows documented scenario rules:
 - produces evidence artifacts (files + diff stats, test report, limitations,
   confidence) that are **labeled as simulated** in the delivery.
 
-### Real: `ClaudeCodeAdapter`
+### Real: `ClaudeCodeAdapter` and `CodexAdapter`
 
-`server/src/engine/adapters/claude-code.ts` drives the locally installed
-Claude Code CLI. At boot, `enableRealAdapters()` (called only from the
-runtime entrypoint, never in tests) probes `claude --version` and upgrades
-the Claude Code worker to this adapter — or reverts it to simulated with an
-event when the CLI disappears.
+Two real adapters drive locally installed coding CLIs. They share
+provider-agnostic machinery in `adapters/cli-common.ts` (workspace
+snapshot + real diff, task brief, final-report extraction, process
+tree-kill, CLI detection); each adapter adds only its own launch flags and
+stream parsing.
+
+At boot, `enableRealAdapters()` (called only from the runtime entrypoint,
+never in tests) probes each CLI via `detectCli` — which retries a few times
+so a transient spawn failure under load doesn't misread an installed CLI as
+missing — and upgrades the matching worker (`wkr_claude_code` → `claude-code`,
+`wkr_codex` → `codex`), or reverts it to simulated (restoring its model
+label) with an event when the CLI is genuinely absent.
+
+**`ClaudeCodeAdapter`** (`adapters/claude-code.ts`) drives the Claude Code
+CLI.
 
 Per run it: creates an isolated workspace under `data/workspaces/<taskId>/`,
 writes a `_TASK_BRIEF.md` (goal, criteria, retry note, handoff context,
@@ -152,15 +162,29 @@ block in its final message) supplies only summary/limitations/confidence.
 Failures (not logged in, non-zero exit, timeout) map to `ctx.blocked` with
 the real error; cancel kills the process tree.
 
-Honesty guarantees: `RunResult.checks` may contain only checks that actually
-ran, and `criteriaMet: null` leaves acceptance criteria unjudged so the
-delivery review tells the owner to inspect the files. Real processes can't
-be paused portably, so the adapter declares `capabilities.pause = false`
-and the engine refuses pause requests with a clear message.
+**`CodexAdapter`** (`adapters/codex.ts`) drives `codex exec --json` with
+`--sandbox workspace-write --skip-git-repo-check -C <workspace> -o
+<lastMsgFile>`, the prompt piped over stdin. Unlike Claude Code (file tools
+only), Codex may run shell commands inside the sandbox — so it can execute
+the code it writes — while writes stay confined to the workspace. Its
+stream-json parser is intentionally defensive (correctness comes from the
+exit code, the `-o` final-message file, and the workspace diff, never from
+guessing the exact event schema), and nested Codex error shapes are
+flattened to a readable message. An optional `CODEX_MODEL` selects the model
+when the account default is unsuitable.
 
-Requirements: one-time `claude /login` by the owner. Adding further real
-adapters (e.g. `codex exec`, or an HTTP call to a local model for Hermes)
-follows the same recipe; nothing in the engine, API, store, or UI changes.
+Honesty guarantees (both real adapters): `RunResult.checks` may contain only
+checks that actually ran, and `criteriaMet: null` leaves acceptance criteria
+unjudged so the delivery review tells the owner to inspect the files. Real
+processes can't be paused portably, so the adapters declare
+`capabilities.pause = false` and the engine refuses pause requests with a
+clear message.
+
+Requirements: one-time login by the owner (`claude /login`, `codex login`).
+**Antigravity** has no headless CLI today, so it is intentionally not in the
+probe table and stays simulated. Adding another real adapter (a Gemini/
+Antigravity CLI if one ships, or a local model over HTTP for Hermes) follows
+the same recipe; nothing in the engine, API, store, or UI changes.
 
 ## API surface
 
@@ -202,13 +226,13 @@ behind the same methods.
 
 ## Simulated vs real, precisely
 
-| Real and working                                         | Simulated                                            |
-| --------------------------------------------------------- | ---------------------------------------------------- |
-| Intake parsing (rule-based, local)                        | Codex / Antigravity / Hermes execution               |
-| Routing engine + explanations                             | Their file changes & test counts in evidence         |
-| Lifecycle state machine + approvals                       | Their blockers (injected by scenario rules)          |
-| **Claude Code worker: real CLI sessions, real file diffs**| Test execution for real runs (disabled in v1)        |
-| SSE live updates, pause/resume/cancel                     |                                                      |
-| Retry/reassign + structured handoffs                      |                                                      |
-| Persistence, crash recovery, audit log                    |                                                      |
-| Full REST API + tests (incl. fake-CLI adapter suite)      |                                                      |
+| Real and working                                              | Simulated                                        |
+| -------------------------------------------------------------- | ------------------------------------------------ |
+| Intake parsing (rule-based, local)                             | Antigravity / Hermes execution                   |
+| Routing engine + explanations                                  | Their file changes & test counts in evidence     |
+| Lifecycle state machine + approvals                            | Their blockers (injected by scenario rules)      |
+| **Claude Code & Codex workers: real CLI sessions, real diffs** | Automated test gate for real runs (none in v1)   |
+| SSE live updates, pause/resume/cancel                          |                                                  |
+| Retry/reassign + structured handoffs                           |                                                  |
+| Persistence, crash recovery, audit log                         |                                                  |
+| Full REST API + tests (incl. fake-CLI adapter suites)          |                                                  |
