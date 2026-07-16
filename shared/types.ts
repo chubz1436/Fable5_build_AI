@@ -336,6 +336,7 @@ export type StreamMessage =
   | { kind: 'approval'; approval: Approval }
   | { kind: 'handoff'; handoff: Handoff }
   | { kind: 'attempt'; attempt: Attempt }
+  | { kind: 'project'; project: Project }
   | { kind: 'hello'; system: SystemStatus };
 
 // ---------------------------------------------------------------------------

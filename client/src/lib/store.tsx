@@ -87,6 +87,8 @@ function reducer(state: AppState, action: Action): AppState {
           return { ...state, handoffs: upsert(state.handoffs, m.handoff) };
         case 'attempt':
           return { ...state, attempts: upsert(state.attempts, m.attempt) };
+        case 'project':
+          return { ...state, projects: upsert(state.projects, m.project) };
         case 'event':
           return {
             ...state,
@@ -138,6 +140,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setTimeout(bootstrap, 1500);
       }
     };
+
+    // bootstrap immediately (an unauthenticated EventSource never fires
+    // onopen, and the 401 must surface the sign-in screen)
+    void bootstrap();
 
     const es = new EventSource('/api/stream');
     esRef.current = es;

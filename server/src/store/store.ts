@@ -139,6 +139,7 @@ export class Store {
         'INSERT INTO projects(id, kind, json) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, json = excluded.json',
       )
       .run(project.id, project.kind, JSON.stringify(project));
+    this.broadcast({ kind: 'project', project });
     return project;
   }
 
