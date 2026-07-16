@@ -6,12 +6,14 @@ worker, approve the important moments, watch execution live, recover from
 blockers, and review hard evidence before accepting the delivery — instead of
 juggling separate apps and copy-pasting prompts.
 
-> **Honesty up front:** all worker execution today is produced by a local,
-> deterministic **simulation engine**. No external AI is called, no
-> credentials are needed, nothing outside this folder is touched. The adapter
-> interface where real workers (Claude Code, Codex, Antigravity, Hermes, …)
-> plug in later is real and documented — see
-> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Honesty up front:** the Command Center is hybrid. The **Claude Code
+> worker is real** — when the Claude Code CLI is detected at boot, tasks
+> dispatched to it run an actual headless CLI session in an isolated
+> per-task workspace (requires a one-time `claude /login` on this machine).
+> All other workers (Codex, Antigravity, Hermes) run on a local,
+> deterministic **simulation engine** — no external AI is called for them
+> and nothing pretends otherwise; the UI labels every worker's adapter.
+> See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the adapter design.
 
 ![stack](https://img.shields.io/badge/stack-TypeScript%20%C2%B7%20Express%205%20%C2%B7%20React%2019%20%C2%B7%20Vite-8b7bff)
 
@@ -119,10 +121,36 @@ docs/ARCHITECTURE.md    architecture, data model, lifecycle, adapter design
   file; a future real adapter is designed to run in isolated workspaces with
   owner approval gates (see architecture doc).
 
+## The real Claude Code worker
+
+At boot the server probes for the Claude Code CLI (`claude --version`).
+When found, the Claude Code worker is upgraded to the **real adapter**
+(green `REAL · claude-code` badge in the roster; otherwise it stays
+simulated and says so). A real run:
+
+1. creates an isolated workspace under `data/workspaces/<taskId>/` — never
+   a real repository checkout;
+2. writes a task brief and spawns `claude -p` headless with
+   `--permission-mode acceptEdits` and a **file-tools-only allowlist**
+   (no Bash, no network), plus a hard timeout;
+3. streams the live session (model, commentary, tool calls) into the task's
+   log console over SSE;
+4. computes evidence by **diffing real workspace snapshots** — file changes
+   in the delivery are what actually happened on disk, never model claims;
+5. reports honestly: no automated tests run in v1, so acceptance criteria
+   stay unjudged and the delivery review says "inspect the files yourself".
+
+Requirements: the CLI must be logged in once (`claude /login` in any
+terminal, owner action). Real CLI runs cannot be paused (the UI hides the
+button; the API refuses with a clear message) — cancel or let them finish.
+Sessions use your local Claude subscription and incur normal usage.
+
 ## Known limitations
 
-- Worker execution is simulated (see the honesty note above); file diffs and
-  test counts in evidence are illustrative artifacts.
+- Codex / Antigravity / Hermes execution is simulated; their file diffs and
+  test counts in evidence are illustrative artifacts (labeled as such).
+- Real Claude Code runs don't execute tests yet (Bash is disabled by
+  design in v1); the owner reviews the workspace files before accepting.
 - Single owner, no auth — by design for a personal local tool.
 - JSON-file persistence is perfect for one user but not concurrent writers;
   the store API is repository-shaped so SQLite can replace it without
@@ -133,7 +161,7 @@ docs/ARCHITECTURE.md    architecture, data model, lifecycle, adapter design
 
 ## Next milestone
 
-Implement the first real adapter (`claude-code`) — spawn the Claude Code CLI
-in an isolated per-task workspace, stream its output into the existing
-RunContext, map exit conditions to `finished`/`blocked`, and diff the
-workspace for real evidence.
+Harden the real adapter: opt-in verification commands (run the workspace's
+test suite in a sandboxed step with its output attached to evidence), real
+mid-run approval hooks via permission prompts, and a second real adapter
+(local model over HTTP for Hermes).

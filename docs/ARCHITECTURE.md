@@ -132,20 +132,35 @@ between (and during) steps, and follows documented scenario rules:
 - produces evidence artifacts (files + diff stats, test report, limitations,
   confidence) that are **labeled as simulated** in the delivery.
 
-### Later: real adapters
+### Real: `ClaudeCodeAdapter`
 
-A real `claude-code` adapter would, inside `start()`:
+`server/src/engine/adapters/claude-code.ts` drives the locally installed
+Claude Code CLI. At boot, `enableRealAdapters()` (called only from the
+runtime entrypoint, never in tests) probes `claude --version` and upgrades
+the Claude Code worker to this adapter — or reverts it to simulated with an
+event when the CLI disappears.
 
-1. create an isolated workspace (never a shared checkout),
-2. render the task + handoff context into a prompt/spec file,
-3. spawn `claude -p …` (or `codex exec`, or an HTTP call to a local model),
-4. stream stdout → `ctx.log`, milestones → `ctx.phase`/`ctx.stepDone`,
-5. call `ctx.requestApproval` before privileged operations,
-6. on exit: diff the workspace, run the project's tests, and call
-   `ctx.finished({filesChanged, tests, …})` — or `ctx.blocked(reason)`.
+Per run it: creates an isolated workspace under `data/workspaces/<taskId>/`,
+writes a `_TASK_BRIEF.md` (goal, criteria, retry note, handoff context,
+rules), pipes the prompt over **stdin** to `claude -p --output-format
+stream-json --verbose --permission-mode acceptEdits --allowedTools
+Write,Edit,Read,Glob,Grep` (file tools only — no Bash, no network), parses
+the stream-json events into live `ctx.log`/`ctx.progress` updates, and on
+success diffs before/after workspace snapshots so `filesChanged` reflects
+what actually happened on disk. The model's own self-report (a fenced JSON
+block in its final message) supplies only summary/limitations/confidence.
+Failures (not logged in, non-zero exit, timeout) map to `ctx.blocked` with
+the real error; cancel kills the process tree.
 
-Nothing in the engine, API, store, or UI changes; register the adapter in
-`Engine`'s adapter map and set the worker's `adapter` field.
+Honesty guarantees: `RunResult.checks` may contain only checks that actually
+ran, and `criteriaMet: null` leaves acceptance criteria unjudged so the
+delivery review tells the owner to inspect the files. Real processes can't
+be paused portably, so the adapter declares `capabilities.pause = false`
+and the engine refuses pause requests with a clear message.
+
+Requirements: one-time `claude /login` by the owner. Adding further real
+adapters (e.g. `codex exec`, or an HTTP call to a local model for Hermes)
+follows the same recipe; nothing in the engine, API, store, or UI changes.
 
 ## API surface
 
@@ -187,12 +202,13 @@ behind the same methods.
 
 ## Simulated vs real, precisely
 
-| Real and working                          | Simulated                             |
-| ----------------------------------------- | ------------------------------------- |
-| Intake parsing (rule-based, local)        | Worker "thinking"/execution           |
-| Routing engine + explanations             | File changes & test counts in evidence|
-| Lifecycle state machine + approvals       | Blockers (injected by scenario rules) |
-| SSE live updates, pause/resume/cancel     |                                       |
-| Retry/reassign + structured handoffs      |                                       |
-| Persistence, crash recovery, audit log    |                                       |
-| Full REST API + tests                     |                                       |
+| Real and working                                         | Simulated                                            |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| Intake parsing (rule-based, local)                        | Codex / Antigravity / Hermes execution               |
+| Routing engine + explanations                             | Their file changes & test counts in evidence         |
+| Lifecycle state machine + approvals                       | Their blockers (injected by scenario rules)          |
+| **Claude Code worker: real CLI sessions, real file diffs**| Test execution for real runs (disabled in v1)        |
+| SSE live updates, pause/resume/cancel                     |                                                      |
+| Retry/reassign + structured handoffs                      |                                                      |
+| Persistence, crash recovery, audit log                    |                                                      |
+| Full REST API + tests (incl. fake-CLI adapter suite)      |                                                      |
