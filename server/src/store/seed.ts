@@ -18,6 +18,8 @@ export function seedIfEmpty(store: Store): void {
     color: '#8b7bff',
     tags: ['frontend', 'feature'],
     createdAt: nowIso(),
+    kind: 'sample',
+    git: null,
   };
   const homelab: Project = {
     id: 'proj_homelab',
@@ -26,6 +28,8 @@ export function seedIfEmpty(store: Store): void {
     color: '#2dd4bf',
     tags: ['backend', 'infra'],
     createdAt: nowIso(),
+    kind: 'sample',
+    git: null,
   };
   const recipes: Project = {
     id: 'proj_recipes',
@@ -34,6 +38,8 @@ export function seedIfEmpty(store: Store): void {
     color: '#f5a623',
     tags: ['backend', 'docs'],
     createdAt: nowIso(),
+    kind: 'sample',
+    git: null,
   };
   [games, homelab, recipes].forEach((p) => store.upsertProject(p));
 
@@ -56,6 +62,7 @@ export function seedIfEmpty(store: Store): void {
       currentTaskId: null,
       adapter: 'simulated',
       integration: 'simulated',
+      readiness: null,
       completedTaskCount: 12,
     },
     {
@@ -72,6 +79,7 @@ export function seedIfEmpty(store: Store): void {
       currentTaskId: null,
       adapter: 'simulated',
       integration: 'simulated',
+      readiness: null,
       completedTaskCount: 9,
     },
     {
@@ -88,6 +96,7 @@ export function seedIfEmpty(store: Store): void {
       currentTaskId: null,
       adapter: 'simulated',
       integration: 'simulated',
+      readiness: null,
       completedTaskCount: 7,
     },
     {
@@ -104,6 +113,7 @@ export function seedIfEmpty(store: Store): void {
       currentTaskId: null,
       adapter: 'simulated',
       integration: 'simulated',
+      readiness: null,
       completedTaskCount: 4,
     },
   ];
@@ -187,6 +197,8 @@ export function seedIfEmpty(store: Store): void {
       finalOwnerAction: 'accepted',
     },
     handoffIds: [],
+    gitProjectId: null,
+    activeAttemptId: null,
     createdAt: new Date(Date.now() - 86_400_000 * 2).toISOString(),
     updatedAt: new Date(Date.now() - 86_400_000 * 2 + 3_600_000).toISOString(),
     startedAt: new Date(Date.now() - 86_400_000 * 2 + 600_000).toISOString(),
@@ -238,6 +250,8 @@ export function seedIfEmpty(store: Store): void {
     runPlan: null,
     evidence: null,
     handoffIds: [],
+    gitProjectId: null,
+    activeAttemptId: null,
     createdAt: new Date(Date.now() - 3_600_000 * 5).toISOString(),
     updatedAt: new Date(Date.now() - 3_600_000 * 5).toISOString(),
     startedAt: null,
@@ -269,6 +283,8 @@ export function seedIfEmpty(store: Store): void {
     runPlan: null,
     evidence: null,
     handoffIds: [],
+    gitProjectId: null,
+    activeAttemptId: null,
     createdAt: new Date(Date.now() - 3_600_000 * 30).toISOString(),
     updatedAt: new Date(Date.now() - 3_600_000 * 30).toISOString(),
     startedAt: null,

@@ -21,6 +21,7 @@ export function createRoutes(ctx: AppContext): Router {
       workers: store.workers,
       approvals: store.approvals,
       handoffs: store.handoffs,
+      attempts: store.recentAttempts(100),
       events: store.recentEvents(250),
       system: ctx.systemStatus(),
     };
@@ -70,6 +71,8 @@ export function createRoutes(ctx: AppContext): Router {
       runPlan: null,
       evidence: null,
       handoffIds: [],
+      gitProjectId: null,
+      activeAttemptId: null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       startedAt: null,

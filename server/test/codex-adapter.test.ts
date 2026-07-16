@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import request from 'supertest';
+
 import { describe, expect, it } from 'vitest';
 import type { Approval, Task, TaskDraft } from '../../shared/types';
 import { testContext, waitFor } from './helpers';
@@ -11,7 +11,7 @@ const FAKE_CLI = `"${process.execPath}" "${path.join(here, 'fixtures', 'fake-cod
 
 describe('codex adapter end-to-end (fake CLI)', () => {
   it('runs a real Codex task: exec --json → live logs → workspace evidence → owner review', async () => {
-    const { ctx, app, dataFile } = testContext({ codexCommand: FAKE_CLI });
+    const { ctx, agent, dataDir } = testContext({ codexCommand: FAKE_CLI });
     const store = ctx.store;
 
     // promote the Codex worker to the real adapter (what boot detection does)
@@ -20,28 +20,28 @@ describe('codex adapter end-to-end (fake CLI)', () => {
     worker.integration = 'real';
     store.upsertWorker(worker);
 
-    const parse = await request(app)
+    const parse = await agent
       .post('/api/tasks/parse')
       .send({ text: 'Add a greeting script to the Recipe Box' })
       .expect(200);
-    const created = await request(app)
+    const created = await agent
       .post('/api/tasks')
       .send(parse.body as TaskDraft)
       .expect(201);
     const taskId = (created.body as Task).id;
 
-    const reqStart = await request(app)
+    const reqStart = await agent
       .post(`/api/tasks/${taskId}/request-start`)
       .send({ workerId: 'wkr_codex' })
       .expect(200);
-    await request(app)
+    await agent
       .post(`/api/approvals/${(reqStart.body as { approval: Approval }).approval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
     expect(store.task(taskId)!.status).toBe('running');
 
     // real CLI processes can't be paused — the engine refuses honestly
-    const pauseRes = await request(app).post(`/api/tasks/${taskId}/pause`).send({});
+    const pauseRes = await agent.post(`/api/tasks/${taskId}/pause`).send({});
     expect(pauseRes.status).toBe(409);
     expect(pauseRes.body.error).toContain('cannot be paused');
 
@@ -59,9 +59,9 @@ describe('codex adapter end-to-end (fake CLI)', () => {
     expect(task.evidence!.workPerformed).toContain('Ran python greet.py');
 
     // the file genuinely exists in the isolated workspace; lastmsg sink does not pollute it
-    const wsFile = path.join(path.dirname(dataFile), 'workspaces', taskId, 'greet.py');
+    const wsFile = path.join(dataDir, 'workspaces', taskId, 'greet.py');
     expect(fs.existsSync(wsFile)).toBe(true);
-    expect(fs.existsSync(path.join(path.dirname(dataFile), 'workspaces', `${taskId}.lastmsg.txt`))).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'workspaces', `${taskId}.lastmsg.txt`))).toBe(false);
 
     // no automated verification → criteria left for the owner
     expect(task.acceptanceCriteria.every((c) => c.met === null)).toBe(true);
@@ -75,7 +75,7 @@ describe('codex adapter end-to-end (fake CLI)', () => {
       .approvalsForTask(taskId)
       .find((a) => a.type === 'completion' && a.status === 'pending')!;
     expect(completion.recommendationReason).toContain('no automated verification');
-    await request(app)
+    await agent
       .post(`/api/approvals/${completion.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
@@ -83,7 +83,7 @@ describe('codex adapter end-to-end (fake CLI)', () => {
   });
 
   it('blocks with a clear reason when the Codex CLI cannot launch', async () => {
-    const { ctx, app } = testContext({
+    const { ctx, agent } = testContext({
       codexCommand: '"definitely-not-codex-xyz"',
       codexTimeoutMs: 5000,
     });
@@ -92,14 +92,14 @@ describe('codex adapter end-to-end (fake CLI)', () => {
     worker.adapter = 'codex';
     store.upsertWorker(worker);
 
-    const parse = await request(app).post('/api/tasks/parse').send({ text: 'Write a note file' }).expect(200);
-    const created = await request(app).post('/api/tasks').send(parse.body).expect(201);
+    const parse = await agent.post('/api/tasks/parse').send({ text: 'Write a note file' }).expect(200);
+    const created = await agent.post('/api/tasks').send(parse.body).expect(201);
     const taskId = (created.body as Task).id;
-    const reqStart = await request(app)
+    const reqStart = await agent
       .post(`/api/tasks/${taskId}/request-start`)
       .send({ workerId: 'wkr_codex' })
       .expect(200);
-    await request(app)
+    await agent
       .post(`/api/approvals/${(reqStart.body as { approval: Approval }).approval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);

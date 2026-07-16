@@ -44,6 +44,39 @@ export interface Project {
   color: string;
   tags: string[];
   createdAt: string;
+  /** 'sample' projects exist for the simulated demo; 'git' projects are registered local repositories */
+  kind: 'sample' | 'git';
+  /** present only when kind === 'git' */
+  git: GitProjectInfo | null;
+}
+
+/** One safe, structured validation command (argv — never a shell string). */
+export interface ValidationCommand {
+  id: string;
+  name: string;
+  /** argv[0] is the executable; no shell interpretation ever happens */
+  argv: string[];
+  required: boolean;
+  timeoutMs: number;
+}
+
+export type RepoHealth = 'ok' | 'dirty' | 'missing' | 'error';
+
+export interface GitProjectInfo {
+  /** path as registered by the owner */
+  repoRoot: string;
+  /** fully resolved real path (symlinks/junctions resolved) */
+  canonicalRoot: string;
+  baseBranch: string;
+  /** HEAD of baseBranch at last verification */
+  baseCommit: string;
+  validationCommands: ValidationCommand[];
+  /** repo-relative path prefixes a worker must not touch */
+  protectedPaths: string[];
+  enabled: boolean;
+  health: RepoHealth;
+  healthDetail: string | null;
+  lastVerifiedAt: string | null;
 }
 
 export interface WorkerProfile {
@@ -71,6 +104,31 @@ export interface WorkerProfile {
    */
   integration: 'simulated' | 'real' | 'planned';
   completedTaskCount: number;
+  /** live readiness of the underlying adapter (real adapters only) */
+  readiness: WorkerReadiness | null;
+}
+
+export type ReadinessState =
+  | 'UNAVAILABLE'
+  | 'VERSION_UNVERIFIED'
+  | 'AUTH_REQUIRED'
+  | 'READY'
+  | 'DEGRADED'
+  | 'BUSY'
+  | 'RATE_LIMITED'
+  | 'QUOTA_EXHAUSTED'
+  | 'DISABLED';
+
+export interface WorkerReadiness {
+  state: ReadinessState;
+  executablePath: string | null;
+  version: string | null;
+  /** 'unknown' until a run proves it either way */
+  authStatus: 'ok' | 'required' | 'unknown';
+  lastCheckAt: string | null;
+  lastError: string | null;
+  supportsCancel: boolean;
+  sandbox: string | null;
 }
 
 export interface AcceptanceCriterion {
@@ -155,6 +213,10 @@ export interface Task {
   runPlan: RunStep[] | null;
   evidence: Evidence | null;
   handoffIds: string[];
+  /** set when this task targets a registered git project (real execution path) */
+  gitProjectId: string | null;
+  /** the currently active (or most recent) attempt for git-backed tasks */
+  activeAttemptId: string | null;
   createdAt: string;
   updatedAt: string;
   startedAt: string | null;
@@ -176,6 +238,20 @@ export interface Approval {
   createdAt: string;
   decidedAt: string | null;
   decisionNote: string | null;
+
+  // -- exact-grant binding (git-backed executions) --------------------------
+  /** attempt this approval authorized (set at consumption for start grants) */
+  attemptId: string | null;
+  /** git project this approval is bound to */
+  projectId: string | null;
+  workerId: string | null;
+  /** repo HEAD the grant was issued against; consumption fails if it moved */
+  baseCommit: string | null;
+  /** canonical hash of the exact authorized action payload */
+  payloadHash: string | null;
+  expiresAt: string | null;
+  singleUse: boolean;
+  consumedAt: string | null;
 }
 
 /** Structured context passed when a task moves between workers. */
@@ -223,6 +299,7 @@ export interface StateSnapshot {
   workers: WorkerProfile[];
   approvals: Approval[];
   handoffs: Handoff[];
+  attempts: Attempt[];
   /** most recent events, newest first */
   events: EventRecord[];
   system: SystemStatus;
@@ -258,4 +335,139 @@ export type StreamMessage =
   | { kind: 'worker'; worker: WorkerProfile }
   | { kind: 'approval'; approval: Approval }
   | { kind: 'handoff'; handoff: Handoff }
+  | { kind: 'attempt'; attempt: Attempt }
   | { kind: 'hello'; system: SystemStatus };
+
+// ---------------------------------------------------------------------------
+// Durable execution model: Task → Attempt → Operation
+// ---------------------------------------------------------------------------
+
+export type AttemptState =
+  | 'creating_worktree'
+  | 'running'
+  | 'validating'
+  | 'ready_for_review'
+  | 'accepted'
+  | 'rejected'
+  | 'cancelled'
+  | 'failed'
+  | 'timeout'
+  | 'unknown_outcome'          // process fate unprovable after a restart
+  | 'blocked_reconciliation';  // needs owner action after recovery
+
+export const ACTIVE_ATTEMPT_STATES: AttemptState[] = [
+  'creating_worktree',
+  'running',
+  'validating',
+];
+
+export type ExitReason =
+  | 'success'
+  | 'failure'
+  | 'cancelled'
+  | 'timeout'
+  | 'auth_required'
+  | 'rate_limited'
+  | 'quota_exhausted'
+  | 'unavailable'
+  | 'unknown';
+
+export type ValidationStatus = 'VERIFIED' | 'FAILED' | 'PARTIAL' | 'UNVERIFIED';
+
+export interface ValidationStepResult {
+  id: string;
+  name: string;
+  argv: string[];
+  cwd: string;
+  required: boolean;
+  startedAt: string;
+  endedAt: string | null;
+  timeoutMs: number;
+  exitCode: number | null;
+  status: 'PASSED' | 'FAILED' | 'TIMEOUT' | 'ERROR' | 'SKIPPED';
+  outputTail: string[];
+}
+
+export interface AttemptValidation {
+  status: ValidationStatus;
+  steps: ValidationStepResult[];
+  completedAt: string | null;
+}
+
+/** Real evidence captured from the attempt worktree — never from worker claims. */
+export interface AttemptEvidence {
+  changedFiles: FileChange[];
+  diffStat: string;
+  /** unified diff, size-capped */
+  diff: string;
+  diffTruncated: boolean;
+  gitStatus: string;
+  protectedViolations: string[];
+  workerLogTail: string[];
+}
+
+export interface Attempt {
+  id: string;
+  taskId: string;
+  workerId: string;
+  adapter: string; // 'codex' | 'test'
+  model: string | null;
+  /** registered git project */
+  projectId: string;
+  baseBranch: string;
+  baseCommit: string;
+  worktreePath: string | null;
+  branchName: string | null;
+  approvalId: string;
+  state: AttemptState;
+  exitReason: ExitReason | null;
+  executablePath: string | null;
+  executableVersion: string | null;
+  pid: number | null;
+  startedAt: string;
+  endedAt: string | null;
+  failureReason: string | null;
+  validation: AttemptValidation | null;
+  evidence: AttemptEvidence | null;
+  delivery: 'accepted' | 'rejected' | 'correction_requested' | null;
+  worktreeCleanedAt: string | null;
+  worktreeHealth: 'ok' | 'missing' | 'branch_mismatch' | 'unknown' | null;
+}
+
+export type OperationKind =
+  | 'create_worktree'
+  | 'start_worker'
+  | 'cancel_worker'
+  | 'capture_diff'
+  | 'run_validation'
+  | 'consume_approval'
+  | 'cleanup_worktree'
+  | 'reconcile';
+
+export interface OperationRecord {
+  id: string;
+  attemptId: string;
+  kind: OperationKind;
+  /** unique — duplicate submissions cannot re-run the same consequence */
+  idempotencyKey: string;
+  status: 'running' | 'succeeded' | 'failed' | 'timeout' | 'unknown';
+  startedAt: string;
+  endedAt: string | null;
+  /** structured description of the exact action (JSON argv or action payload) */
+  command: string | null;
+  exitCode: number | null;
+  timeoutMs: number | null;
+  error: string | null;
+}
+
+export type LeaseKind = 'task' | 'worker' | 'repo';
+
+export interface Lease {
+  id: string;
+  kind: LeaseKind;
+  resourceKey: string;
+  attemptId: string;
+  acquiredAt: string;
+  expiresAt: string;
+  releasedAt: string | null;
+}

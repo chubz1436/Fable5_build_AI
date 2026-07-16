@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import request from 'supertest';
+
 import { describe, expect, it } from 'vitest';
 import type { Approval, Task, TaskDraft } from '../../shared/types';
 import {
@@ -64,7 +64,7 @@ describe('claude-code adapter helpers', () => {
 
 describe('claude-code adapter end-to-end (fake CLI)', () => {
   it('runs a real-adapter task: spawn → stream logs → workspace evidence → owner review', async () => {
-    const { ctx, app, dataFile } = testContext({ claudeCommand: FAKE_CLI });
+    const { ctx, agent, dataDir } = testContext({ claudeCommand: FAKE_CLI });
     const store = ctx.store;
 
     // promote the Claude Code worker to the real adapter (what boot detection does)
@@ -73,28 +73,28 @@ describe('claude-code adapter end-to-end (fake CLI)', () => {
     worker.integration = 'real';
     store.upsertWorker(worker);
 
-    const parse = await request(app)
+    const parse = await agent
       .post('/api/tasks/parse')
       .send({ text: 'Write a hello file for the Recipe Box docs' })
       .expect(200);
-    const created = await request(app)
+    const created = await agent
       .post('/api/tasks')
       .send(parse.body as TaskDraft)
       .expect(201);
     const taskId = (created.body as Task).id;
 
-    const reqStart = await request(app)
+    const reqStart = await agent
       .post(`/api/tasks/${taskId}/request-start`)
       .send({ workerId: 'wkr_claude_code' })
       .expect(200);
-    await request(app)
+    await agent
       .post(`/api/approvals/${(reqStart.body as { approval: Approval }).approval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
     expect(store.task(taskId)!.status).toBe('running');
 
     // real CLI processes cannot be paused — the engine must refuse honestly
-    const pauseRes = await request(app).post(`/api/tasks/${taskId}/pause`).send({});
+    const pauseRes = await agent.post(`/api/tasks/${taskId}/pause`).send({});
     expect(pauseRes.status).toBe(409);
     expect(pauseRes.body.error).toContain('cannot be paused');
 
@@ -110,7 +110,7 @@ describe('claude-code adapter end-to-end (fake CLI)', () => {
     expect(task.evidence!.workPerformed).toEqual(['Wrote hello.txt']);
 
     // the file genuinely exists on disk in the isolated workspace
-    const workspaceFile = path.join(path.dirname(dataFile), 'workspaces', taskId, 'hello.txt');
+    const workspaceFile = path.join(dataDir, 'workspaces', taskId, 'hello.txt');
     expect(fs.existsSync(workspaceFile)).toBe(true);
     expect(fs.readFileSync(workspaceFile, 'utf8')).toContain('hello from fake claude');
 
@@ -127,7 +127,7 @@ describe('claude-code adapter end-to-end (fake CLI)', () => {
       .approvalsForTask(taskId)
       .find((a) => a.type === 'completion' && a.status === 'pending')!;
     expect(completion.recommendationReason).toContain('no automated verification');
-    await request(app)
+    await agent
       .post(`/api/approvals/${completion.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
@@ -135,7 +135,7 @@ describe('claude-code adapter end-to-end (fake CLI)', () => {
   });
 
   it('blocks with a clear reason when the CLI cannot launch', async () => {
-    const { ctx, app } = testContext({
+    const { ctx, agent } = testContext({
       claudeCommand: '"definitely-not-a-real-command-xyz"',
       claudeTimeoutMs: 5000,
     });
@@ -144,17 +144,17 @@ describe('claude-code adapter end-to-end (fake CLI)', () => {
     worker.adapter = 'claude-code';
     store.upsertWorker(worker);
 
-    const parse = await request(app)
+    const parse = await agent
       .post('/api/tasks/parse')
       .send({ text: 'Write a tiny note file' })
       .expect(200);
-    const created = await request(app).post('/api/tasks').send(parse.body).expect(201);
+    const created = await agent.post('/api/tasks').send(parse.body).expect(201);
     const taskId = (created.body as Task).id;
-    const reqStart = await request(app)
+    const reqStart = await agent
       .post(`/api/tasks/${taskId}/request-start`)
       .send({ workerId: 'wkr_claude_code' })
       .expect(200);
-    await request(app)
+    await agent
       .post(`/api/approvals/${(reqStart.body as { approval: Approval }).approval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);

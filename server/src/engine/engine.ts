@@ -36,7 +36,7 @@ export class Engine {
     private readonly store: Store,
     private readonly config: AppConfig,
   ) {
-    const workspaceRoot = path.join(path.dirname(config.dataFile), 'workspaces');
+    const workspaceRoot = path.join(config.dataDir, 'workspaces');
     this.adapters.set('simulated', new SimulatedAdapter());
     this.adapters.set(
       'claude-code',
@@ -153,6 +153,14 @@ export class Engine {
       createdAt: nowIso(),
       decidedAt: null,
       decisionNote: null,
+      attemptId: null,
+      projectId: null,
+      workerId: null,
+      baseCommit: null,
+      payloadHash: null,
+      expiresAt: null,
+      singleUse: false,
+      consumedAt: null,
     };
     this.store.upsertApproval(approval);
     this.store.addEvent({
@@ -502,6 +510,14 @@ export class Engine {
           createdAt: nowIso(),
           decidedAt: null,
           decisionNote: null,
+          attemptId: null,
+          projectId: null,
+          workerId: null,
+          baseCommit: null,
+          payloadHash: null,
+          expiresAt: null,
+          singleUse: false,
+          consumedAt: null,
         };
         this.store.upsertApproval(approval);
         task.phase = 'Waiting for owner approval';
@@ -636,6 +652,14 @@ export class Engine {
       createdAt: nowIso(),
       decidedAt: null,
       decisionNote: null,
+      attemptId: null,
+      projectId: null,
+      workerId: null,
+      baseCommit: null,
+      payloadHash: null,
+      expiresAt: null,
+      singleUse: false,
+      consumedAt: null,
     };
     this.store.upsertApproval(approval);
     this.store.addEvent({

@@ -1,4 +1,4 @@
-import request from 'supertest';
+
 import { describe, expect, it } from 'vitest';
 import type { Approval, Task, TaskDraft } from '../../shared/types';
 import { testContext, waitFor } from './helpers';
@@ -11,11 +11,11 @@ import { testContext, waitFor } from './helpers';
  */
 describe('full task flow (API)', () => {
   it('runs the complete high-risk scenario: parse → approve → midrun gate → blocker → retry → review → complete', async () => {
-    const { ctx, app } = testContext();
+    const { ctx, agent } = testContext();
     const store = ctx.store;
 
     // 1. natural language → structured draft
-    const parse = await request(app)
+    const parse = await agent
       .post('/api/tasks/parse')
       .send({ text: 'Urgent: migrate the Recipe Box database schema to support recipe tags' })
       .expect(200);
@@ -26,18 +26,18 @@ describe('full task flow (API)', () => {
     expect(draft.recommendation.reasons.length).toBeGreaterThan(0);
 
     // 2. create the task
-    const created = await request(app).post('/api/tasks').send(draft).expect(201);
+    const created = await agent.post('/api/tasks').send(draft).expect(201);
     const taskId = (created.body as Task).id;
     expect((created.body as Task).status).toBe('ready');
 
     // 3. request start → start approval pending
-    const reqStart = await request(app).post(`/api/tasks/${taskId}/request-start`).send({}).expect(200);
+    const reqStart = await agent.post(`/api/tasks/${taskId}/request-start`).send({}).expect(200);
     const startApproval = (reqStart.body as { approval: Approval }).approval;
     expect(startApproval.type).toBe('start');
     expect(store.task(taskId)!.status).toBe('awaiting_approval');
 
     // 4. owner approves → worker starts
-    await request(app)
+    await agent
       .post(`/api/approvals/${startApproval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
@@ -52,7 +52,7 @@ describe('full task flow (API)', () => {
     );
     const midrun = store.approvalsForTask(taskId).find((a) => a.type === 'midrun')!;
     expect(midrun.affectedScope.length).toBeGreaterThan(0);
-    await request(app)
+    await agent
       .post(`/api/approvals/${midrun.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
@@ -64,7 +64,7 @@ describe('full task flow (API)', () => {
     expect(store.worker(workerId)!.availability).toBe('idle');
 
     // 7. retry → second attempt completes and verification passes
-    await request(app).post(`/api/tasks/${taskId}/retry`).send({}).expect(200);
+    await agent.post(`/api/tasks/${taskId}/retry`).send({}).expect(200);
     await waitFor(() => store.task(taskId)!.status === 'review', 'review after retry', 15000);
     const reviewed = store.task(taskId)!;
     expect(reviewed.evidence).toBeTruthy();
@@ -82,7 +82,7 @@ describe('full task flow (API)', () => {
       .approvalsForTask(taskId)
       .find((a) => a.type === 'completion' && a.status === 'pending')!;
     expect(completion).toBeTruthy();
-    await request(app)
+    await agent
       .post(`/api/approvals/${completion.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
@@ -111,21 +111,21 @@ describe('full task flow (API)', () => {
   });
 
   it('hands a blocked task to another worker with structured context', async () => {
-    const { ctx, app } = testContext();
+    const { ctx, agent } = testContext();
     const store = ctx.store;
 
-    const parse = await request(app)
+    const parse = await agent
       .post('/api/tasks/parse')
       .send({ text: 'Refactor the sensor polling api in the Home Lab Dashboard' })
       .expect(200);
     const draft = parse.body as TaskDraft;
     expect(draft.risk).toBe('medium'); // refactor+api ⇒ blocker on attempt 1
 
-    const created = await request(app).post('/api/tasks').send(draft).expect(201);
+    const created = await agent.post('/api/tasks').send(draft).expect(201);
     const taskId = (created.body as Task).id;
 
-    const reqStart = await request(app).post(`/api/tasks/${taskId}/request-start`).send({}).expect(200);
-    await request(app)
+    const reqStart = await agent.post(`/api/tasks/${taskId}/request-start`).send({}).expect(200);
+    await agent
       .post(`/api/approvals/${(reqStart.body as { approval: Approval }).approval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
@@ -134,7 +134,7 @@ describe('full task flow (API)', () => {
     const fromWorker = store.task(taskId)!.assignedWorkerId!;
     const toWorker = store.workers.find((w) => w.id !== fromWorker && w.availability === 'idle')!.id;
 
-    const reassign = await request(app)
+    const reassign = await agent
       .post(`/api/tasks/${taskId}/reassign`)
       .send({ workerId: toWorker, reason: 'Trying a different specialist' })
       .expect(200);
@@ -153,55 +153,55 @@ describe('full task flow (API)', () => {
   });
 
   it('supports pause, resume and cancel while running', async () => {
-    const { ctx, app } = testContext({ simSpeed: 40 }); // slower so we can pause mid-run
+    const { ctx, agent } = testContext({ simSpeed: 40 }); // slower so we can pause mid-run
     const store = ctx.store;
 
-    const parse = await request(app)
+    const parse = await agent
       .post('/api/tasks/parse')
       .send({ text: 'Add a settings page to the Home Lab Dashboard' })
       .expect(200);
-    const created = await request(app).post('/api/tasks').send(parse.body).expect(201);
+    const created = await agent.post('/api/tasks').send(parse.body).expect(201);
     const taskId = (created.body as Task).id;
 
-    const reqStart = await request(app).post(`/api/tasks/${taskId}/request-start`).send({}).expect(200);
-    await request(app)
+    const reqStart = await agent.post(`/api/tasks/${taskId}/request-start`).send({}).expect(200);
+    await agent
       .post(`/api/approvals/${(reqStart.body as { approval: Approval }).approval.id}/decision`)
       .send({ decision: 'approve' })
       .expect(200);
 
-    await request(app).post(`/api/tasks/${taskId}/pause`).send({}).expect(200);
+    await agent.post(`/api/tasks/${taskId}/pause`).send({}).expect(200);
     expect(store.task(taskId)!.status).toBe('paused');
     const progressAtPause = store.task(taskId)!.progress;
     await new Promise((r) => setTimeout(r, 150));
     expect(store.task(taskId)!.progress).toBe(progressAtPause); // actually paused
 
-    await request(app).post(`/api/tasks/${taskId}/resume`).send({}).expect(200);
+    await agent.post(`/api/tasks/${taskId}/resume`).send({}).expect(200);
     expect(store.task(taskId)!.status).toBe('running');
 
-    await request(app).post(`/api/tasks/${taskId}/cancel`).send({}).expect(200);
+    await agent.post(`/api/tasks/${taskId}/cancel`).send({}).expect(200);
     const cancelled = store.task(taskId)!;
     expect(cancelled.status).toBe('cancelled');
     expect(store.worker(created.body.recommendation.workerId)?.currentTaskId ?? null).toBeNull();
 
     // cancelled is terminal
-    await request(app).post(`/api/tasks/${taskId}/retry`).send({}).expect(409);
+    await agent.post(`/api/tasks/${taskId}/retry`).send({}).expect(409);
   });
 
   it('rejects illegal transitions over the API', async () => {
-    const { ctx, app } = testContext();
+    const { ctx, agent } = testContext();
     const backlogTask = ctx.store.tasks.find((t) => t.status === 'backlog')!;
     // backlog tasks cannot request start without being promoted first
-    await request(app).post(`/api/tasks/${backlogTask.id}/request-start`).send({}).expect(409);
+    await agent.post(`/api/tasks/${backlogTask.id}/request-start`).send({}).expect(409);
     // promote works, then pause (not running) is illegal
-    await request(app).post(`/api/tasks/${backlogTask.id}/promote`).send({}).expect(200);
-    await request(app).post(`/api/tasks/${backlogTask.id}/pause`).send({}).expect(409);
+    await agent.post(`/api/tasks/${backlogTask.id}/promote`).send({}).expect(200);
+    await agent.post(`/api/tasks/${backlogTask.id}/pause`).send({}).expect(409);
     // unknown task
-    await request(app).post(`/api/tasks/task_nope/retry`).send({}).expect(404);
+    await agent.post(`/api/tasks/task_nope/retry`).send({}).expect(404);
   });
 
   it('serves a coherent state snapshot', async () => {
-    const { app } = testContext();
-    const res = await request(app).get('/api/state').expect(200);
+    const { agent } = testContext();
+    const res = await agent.get('/api/state').expect(200);
     expect(res.body.projects.length).toBeGreaterThan(0);
     expect(res.body.workers.length).toBe(4);
     expect(res.body.tasks.length).toBeGreaterThan(0);
