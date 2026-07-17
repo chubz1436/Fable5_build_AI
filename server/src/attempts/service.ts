@@ -450,8 +450,23 @@ export class AttemptService {
     });
     attempt = this.store.attempt(attemptId)!;
     attempt.pid = handle.pid;
+    // record the executable the runner ACTUALLY launched (may be the resolved
+    // .cmd shim where the probe reported the same target)
+    if (handle.executablePath) attempt.executablePath = handle.executablePath;
     this.store.updateAttempt(attempt);
     this.live.set(attemptId, handle);
+
+    // P0.12/req-15: the readiness screen must report the same executable
+    // target that was actually used to run the worker.
+    if (worker.readiness && handle.executablePath) {
+      worker.readiness = {
+        ...worker.readiness,
+        executablePath: handle.executablePath,
+        version: probe.version ?? worker.readiness.version,
+        lastCheckAt: nowIso(),
+      };
+      this.store.upsertWorker(worker);
+    }
 
     const outcome = await handle.done;
     this.live.delete(attemptId);

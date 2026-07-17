@@ -1,5 +1,6 @@
 import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import path from 'node:path';
 import type { EventLevel, ExitReason } from '../../../shared/types';
 
 /**
@@ -44,23 +45,71 @@ export interface ResolvedExecutable {
   viaCmdShim: boolean;
 }
 
-export async function resolveExecutable(command: string): Promise<ResolvedExecutable | null> {
-  const classify = (file: string): ResolvedExecutable => ({
-    file,
-    viaCmdShim: WIN && /\.(cmd|bat)$/i.test(file),
-  });
-  if (/[\\/]/.test(command)) {
-    return fs.existsSync(command) ? classify(command) : null;
+/**
+ * Windows-runnable extensions, most-preferred first: a native entry point
+ * (.com/.exe) beats an npm .cmd/.bat shim. An extensionless file (e.g. the
+ * bash shim npm also drops next to codex.cmd) is NOT runnable via spawn on
+ * Windows — selecting it is exactly the `spawn …\npm\codex ENOENT` bug.
+ */
+const WIN_RUNNABLE = ['.com', '.exe', '.cmd', '.bat'];
+
+function classifyExecutable(file: string): ResolvedExecutable {
+  return { file, viaCmdShim: WIN && /\.(cmd|bat)$/i.test(file) };
+}
+
+function winRank(file: string): number {
+  const i = WIN_RUNNABLE.indexOf(path.extname(file).toLowerCase());
+  return i === -1 ? Number.POSITIVE_INFINITY : i;
+}
+
+/** Resolve an explicit path, PATHEXT-probing runnable siblings on Windows. */
+function resolveExplicitPath(command: string): ResolvedExecutable | null {
+  if (!WIN) return fs.existsSync(command) ? classifyExecutable(command) : null;
+  const ext = path.extname(command).toLowerCase();
+  if (ext && WIN_RUNNABLE.includes(ext) && fs.existsSync(command)) {
+    return classifyExecutable(command);
   }
-  const finder = WIN ? 'where' : 'which';
-  const lines = await new Promise<string[]>((resolve) => {
+  // extensionless (or non-runnable ext) → probe runnable siblings in order,
+  // so `C:\Users\CHUBZ SERVER\AppData\Roaming\npm\codex` → `…\codex.cmd`
+  const base = ext ? command.slice(0, -ext.length) : command;
+  for (const e of WIN_RUNNABLE) {
+    if (fs.existsSync(base + e)) return classifyExecutable(base + e);
+  }
+  return null;
+}
+
+function runFinder(finder: string, command: string): Promise<string[]> {
+  return new Promise((resolve) => {
     execFile(finder, [command], { windowsHide: true, timeout: 8000 }, (err, stdout) => {
       resolve(err ? [] : stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
     });
   });
+}
+
+/**
+ * Resolve a worker/validator executable to something Node can actually spawn.
+ * On Windows this is PATHEXT-aware: it ranks `where` matches native-first and
+ * never returns an extensionless shim (falling back to probing its runnable
+ * siblings if `where` only surfaced the extensionless one).
+ */
+export async function resolveExecutable(command: string): Promise<ResolvedExecutable | null> {
+  if (/[\\/]/.test(command)) return resolveExplicitPath(command);
+
+  const lines = await runFinder(WIN ? 'where' : 'which', command);
   if (lines.length === 0) return null;
-  const exe = lines.find((l) => /\.(exe|com)$/i.test(l));
-  return classify(exe ?? lines[0]!);
+  if (!WIN) return classifyExecutable(lines[0]!);
+
+  const runnable = lines
+    .filter((l) => Number.isFinite(winRank(l)))
+    .sort((a, b) => winRank(a) - winRank(b));
+  if (runnable.length) return classifyExecutable(runnable[0]!);
+
+  // `where` returned only extensionless/non-runnable matches → probe siblings
+  for (const l of lines) {
+    const sib = resolveExplicitPath(l);
+    if (sib) return sib;
+  }
+  return null;
 }
 
 /**
@@ -82,8 +131,14 @@ export function spawnSafe(
       throw new Error(`Unsafe argument for a .cmd shim launch: ${JSON.stringify(a)}`);
     }
   }
+  // NOTE: no `/s`. With `/s`, cmd.exe strips the outer quotes and then breaks
+  // on the space in a path like `C:\Users\CHUBZ SERVER\…\codex.cmd`. Without
+  // it, cmd keeps the quoted executable token intact. The only quoted token is
+  // the resolved executable path we control; every arg is allowlisted
+  // (SAFE_SHIM_ARG: no spaces, quotes, or shell metacharacters), so the line
+  // `"<path>" arg1 arg2` parses safely with no injection surface.
   const line = `"${resolved.file}" ${args.join(' ')}`.trim();
-  return spawn('cmd.exe', ['/d', '/s', '/c', line], {
+  return spawn('cmd.exe', ['/d', '/c', line], {
     ...opts,
     windowsHide: true,
     shell: false,
