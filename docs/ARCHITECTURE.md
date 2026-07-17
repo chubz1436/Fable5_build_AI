@@ -242,17 +242,20 @@ mutation to SSE subscribers.
 
 ## Simulated vs real, precisely
 
-| Real and working                                                        | Simulated / experimental                          |
+| Real and working                                                        | Simulated / quarantined                           |
 | ------------------------------------------------------------------------ | ------------------------------------------------- |
 | SQLite WAL persistence; Task→Attempt→Operation durable model             | Hermes execution (simulated, labeled)              |
-| Git project registry + per-attempt worktree isolation                    | Sample-project runs (simulation engine, labeled)   |
-| Exact single-use approval grants (hash+commit bound, expiring)           | Codex repository runner: code-complete, awaits an  |
-| DB leases (task/worker/repo) + idempotent dispatch                       |   authenticated smoke test (honest `unverified`)   |
-| Real git diff evidence + protected-path enforcement                      | Legacy v0.2 workspace adapters (demo path)         |
-| Independent validation runner (UNVERIFIED/PARTIAL/FAILED/VERIFIED)       |                                                    |
+| Git project registry + per-attempt worktree isolation                    | Sample-project runs (simulation engine, labeled;   |
+| Exact single-use approval grants bound to the full ExecutionSpec         |   ALWAYS simulated — never a real CLI)             |
+| DB leases (task/worker/repo) + idempotent dispatch                       | Legacy v0.2 workspace adapters: QUARANTINED —      |
+| Codex repository runner: real, verified by an authenticated smoke test   |   never instantiated by the Engine; disabled until |
+| Real post-validation git diff evidence + protected-path enforcement      |   migrated onto the hardened attempt pipeline      |
+| Independent validation runner (allowlisted env, mutation detection)      |                                                    |
+| Durable checkpoint commits + loss-refusing cleanup                       |                                                    |
+| Authoritative cancellation (CANCELLING; proven termination)              |                                                    |
 | Crash reconciliation (`unknown_outcome`, re-validate without re-run)     |                                                    |
 | Local security boundary (loopback + token + origin + zod)                |                                                    |
-| SSE live updates; cancel with process-tree kill; full REST API + 60 tests|                                                    |
+| Transactional SSE live updates; full REST API + 85 tests                 |                                                    |
 
 ## Repository-backed execution (v0.3)
 
@@ -261,13 +264,14 @@ Projects registry ──► Task (gitProjectId) ──► exact approval grant
       │                                            │ approve (tx: consume grant +
       │                                            ▼  leases + attempt row)
       │                              AttemptService pipeline
-      │      ┌──────────────┬──────────────┬───────────────┬──────────────┐
-      │      │ create        │ run worker   │ capture REAL  │ independent  │
-      └────► │ worktree      │ (Codex/test  │ git diff +    │ validation   │──► review
-             │ cc/<attempt>  │ runner)      │ protected     │ (argv only)  │    (accept /
-             │ containment-  │ tree-kill    │ paths         │ UNVERIFIED≠  │    correction)
-             │ checked       │ cancel       │               │ PASSED       │
-             └──────────────┴──────────────┴───────────────┴──────────────┘
+      │      ┌──────────────┬──────────────┬──────────────┬───────────────┬──────────────┐
+      │      │ create        │ run worker   │ snapshot +   │ validation    │ post-run     │
+      └────► │ worktree      │ (Codex/test  │ capture diff │ (argv only,   │ snapshot +   │──► checkpoint
+             │ cc/<attempt>  │ runner)      │ + protected  │ allowlisted   │ FINAL diff + │    commit ──► review
+             │ containment-  │ tree-kill    │ paths        │ env, abort-   │ mutation     │    (accept /
+             │ checked       │ cancel       │              │ able)         │ detection    │    correction)
+             └──────────────┴──────────────┴──────────────┴───────────────┴──────────────┘
+        cancellation checkpoints between every phase; leases release only after proven termination
 ```
 
 Key modules: `db/db.ts` (SQLite WAL + migrations + legacy import),
@@ -275,11 +279,18 @@ Key modules: `db/db.ts` (SQLite WAL + migrations + legacy import),
 sanitizers), `attempts/service.ts` (grants, leases, pipeline, recovery,
 cleanup), `attempts/runners.ts` (TestRunner + hardened CodexRunner +
 redaction + safe spawning), `attempts/validator.ts` (independent checks),
+`attempts/integrity.ts` (git/worktree integrity + symlink-escape scan),
 `security/auth.ts` (token + origin + headers). Attempt states:
 `creating_worktree → running → validating → ready_for_review →
-accepted|rejected`, plus `cancelled | failed | timeout | unknown_outcome |
-blocked_reconciliation`. Every consequential step is an Operation row with a
-unique idempotency key; leases live behind partial unique indexes so
-duplicate dispatch and overlapping executions are impossible at the database
-level. Acceptance never merges or pushes; worktree cleanup is explicit and
-always keeps the attempt branch.
+accepted|rejected`, plus `cancelling | cancelled | failed | timeout |
+unknown_outcome | blocked_reconciliation`. Every consequential step is an
+Operation row with a unique idempotency key; leases live behind partial
+unique indexes so duplicate dispatch and overlapping executions are
+impossible at the database level. Start approvals persist their full
+ExecutionSpec and its hash; completion approvals are bound to the final
+evidence hash + checkpoint commit and are invalidated/replaced by any
+worktree change or re-validation. Store broadcasts are buffered inside
+transactions and published only after COMMIT. Acceptance never merges or
+pushes; worktree cleanup refuses to destroy work that lacks a verified
+durable checkpoint (unless the owner explicitly confirms discard) and always
+keeps the attempt branch.

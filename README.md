@@ -13,16 +13,19 @@ merged or pushed automatically, and the owner's working tree is never touched.
 | ----------------------------------- | ------ |
 | Project registration (local git)    | **Real** |
 | Git worktree isolation per attempt  | **Real** |
-| Exact single-use approval grants    | **Real** (payload-hash + base-commit bound, expiring) |
+| Exact single-use approval grants    | **Real** (bound to the full canonical **ExecutionSpec** — goal, scope, criteria, risk, worker, model, repo, base commit, validation commands, protected paths, timeouts, sandbox — re-verified inside the consuming transaction) |
+| Durable delivery checkpoints        | **Real** (app-generated commit on the attempt branch before review; cleanup refuses to destroy un-checkpointed work) |
+| Authoritative cancellation          | **Real** (`cancelling` state; leases released only after child-process termination is proven) |
+| Transactional SSE broadcasts        | **Real** (buffered until COMMIT; discarded on rollback) |
 | Task → Attempt → Operation history  | **Real** (SQLite WAL, durable) |
 | Concurrency leases (task/worker/repo) | **Real** (DB unique constraints) |
 | Independent validation runner       | **Real** (argv-allowlisted commands, worktree-scoped) |
 | Evidence capture (diff/status/logs) | **Real** (from git, never from worker claims) |
 | Crash/restart reconciliation        | **Real** (`unknown_outcome`, `blocked_reconciliation`) |
 | Local security (loopback + token)   | **Real** |
-| Codex adapter (repository attempts) | **Experimental real integration** — code-complete & hardened; classified `unverified` until an authenticated smoke test runs on your machine |
+| Codex adapter (repository attempts) | **Real, verified** — an authenticated smoke test on this machine reached a VERIFIED delivery (codex-cli 0.144.4, 2026-07-17) |
 | Deterministic test runner           | **Real** (used by all automated tests; `ATTEMPT_RUNNER=test`) |
-| Claude Code / Codex / Antigravity workspace adapters (legacy demo path) | Experimental, unchanged from v0.2 |
+| Claude Code / Codex / Antigravity workspace adapters (legacy demo path) | **Quarantined** — never instantiated; sample tasks always run the SimulatedAdapter; real execution only via the hardened attempt pipeline |
 | Hermes                              | Simulated only |
 | Simulation engine (sample projects) | Real code, clearly labeled simulation |
 | Automatic merge / push              | **Not supported by design** |
@@ -54,22 +57,37 @@ The token persists in `data/auth-token.txt`. Every `/api` request requires it
    root). Optionally configure validation commands (structured argv, no
    shell) and protected paths.
 2. **＋ New task** → pick the repository project → describe the goal.
-3. **Dispatch** → an **exact approval grant** is created: bound to the task
-   goal, worker, repository, and current base commit; single-use; expires in
-   30 minutes. If the repo moves or the task changes, the grant is void.
+3. **Dispatch** → an **exact approval grant** is created: bound to the full
+   canonical **ExecutionSpec** (task goal, scope, acceptance criteria, risk,
+   worker, adapter + version, model, repository, base commit, validation
+   commands, protected paths, timeouts, sandbox); single-use; expires in
+   30 minutes. Any material change — repo moved, task edited, validation
+   reconfigured — voids the grant; the hash is recomputed from fresh reads
+   inside the consuming transaction.
 4. **Approve** → the Command Center atomically consumes the grant, takes
    task/worker/repo **leases**, creates branch `cc/<attemptId>` and an
    isolated worktree under `data/worktrees/`, and starts the worker there.
 5. The worker runs (Codex CLI, or the deterministic test runner); events
-   stream live; cancel kills the whole process tree.
-6. The Command Center captures the **actual git diff**, checks **protected
-   paths**, then **independently runs your validation commands** in the
-   worktree. No commands configured → the delivery is **UNVERIFIED** (never
-   silently "passed"); a required failure → **FAILED**.
-7. **Review**: real changed files, unified diff, validation results, worker
-   log tail. Accept (branch stays unmerged for you to merge when you choose),
-   request correction (retry = new grant + new attempt), or cancel. Clean up
-   the worktree explicitly; the branch is always kept.
+   stream live. Cancelling puts the attempt into **CANCELLING**, kills the
+   whole process tree, and only releases leases / settles the task once
+   termination is actually proven.
+6. The Command Center snapshots the worktree, then **independently runs your
+   validation commands** with a **minimal allowlisted environment** (no
+   secrets inherited). A second snapshot detects **every file validation
+   itself modified** — any unexpected mutation forces **FAILED** and the
+   final diff is re-captured so the evidence shows the actual final worktree.
+   Protected paths (case-correct on Windows), symlink/junction escapes and
+   git integrity (branch, `.git` link, worktree registration) are checked
+   too. No commands configured → **UNVERIFIED** (never silently "passed").
+7. Before review, the delivery is committed as an app-generated **checkpoint**
+   on the attempt branch — the work survives worktree cleanup by
+   construction. **Review**: real changed files, post-validation unified
+   diff, validation results, worker log tail. The completion approval is
+   bound to the exact evidence hash; any later worktree change or
+   re-validation invalidates and replaces it. Accept (branch stays unmerged),
+   request correction (retry = new grant + new attempt), or cancel. Cleanup
+   refuses to destroy un-checkpointed work unless you explicitly confirm the
+   irreversible discard; the branch is always kept.
 
 After a crash/restart, interrupted attempts are reconciled — a running worker
 becomes `unknown_outcome` (never blindly retried), interrupted validation
@@ -79,10 +97,24 @@ becomes `blocked_reconciliation` with a one-click "re-run validation only".
 
 The Codex path shells out to your locally installed, logged-in `codex` CLI
 (`codex exec --json`, workspace-write sandbox, prompt via stdin, no shell
-composition). Until you run an authenticated smoke test on your machine it is
-honestly labeled experimental; auth/rate-limit/quota failures are classified
-and surface as blocked attempts. To demo the full workflow without Codex
-credentials, start with `ATTEMPT_RUNNER=test`.
+composition). This path is **verified on this machine**: an authenticated
+smoke test on a disposable repository reached a VERIFIED delivery with
+codex-cli 0.144.4 (2026-07-17). Auth/rate-limit/quota failures are classified
+and surface as blocked attempts. To demo the full workflow without spending
+Codex credits, start with `ATTEMPT_RUNNER=test`.
+
+### Validator execution risk (honest statement)
+
+Validation commands are owner-configured programs executed with your OS
+account's privileges inside the attempt worktree. The Command Center limits
+the blast radius — argv allowlisting (no shell), a minimal allowlisted
+environment (parent secrets are never inherited), per-command timeouts,
+cancellation kill, and post-run worktree snapshots that flag every file the
+validator modified — but it cannot stop a validation command from reading
+anything your OS account can read or making network calls. **Only configure
+validation commands you trust**, exactly as you would trust a package.json
+test script. Build artifacts a validator legitimately produces should be
+gitignored: gitignored outputs are exempt from mutation detection by design.
 
 ## Configuration
 
@@ -100,17 +132,23 @@ credentials, start with `ATTEMPT_RUNNER=test`.
 ## Testing
 
 ```bash
-npm test              # 60 tests: unit + API + full vertical-slice integration
+npm test              # 85 tests: unit + API + full vertical-slice integration
 npm run typecheck
 npm run build
 ```
 
 The integration suite registers throwaway git repositories and drives the
 entire workflow (register → grant → worktree → real change → real diff →
-independent validation → delivery) with the deterministic test runner, and
-covers double-approval, lease conflicts, grant expiry/invalidation,
-cancellation with process-tree kill, protected paths, secret redaction, and
-restart reconciliation. CI (GitHub Actions) runs on Ubuntu and Windows.
+independent validation → checkpoint → delivery) with the deterministic test
+runner, and covers double-approval, lease conflicts, ExecutionSpec
+mutation-after-grant invalidation (goal/scope/criteria/risk/validation
+commands/protected paths/base commit), validation-produced worktree
+mutations and secret-environment isolation, checkpoint recoverability after
+cleanup, cancellation in every pipeline phase (worktree creation, worker,
+validation) with proven process termination, transactional SSE (no phantom
+events on rollback), legacy-adapter quarantine, protected paths, secret
+redaction, and restart reconciliation. CI (GitHub Actions) runs on Ubuntu
+and Windows.
 
 ## Persistence & data
 
@@ -127,30 +165,46 @@ untouched. Back up by copying the `.db` file while the app is stopped.
 - Git and worker processes are spawned with **argument arrays only** — no
   `shell: true` anywhere in the execution path; validation commands are
   argv-allowlisted at registration.
-- Worker/validation subprocess env is stripped of `AUTH_TOKEN` and API keys;
-  logs are secret-redacted before storage/display.
-- Attempts are confined to `data/worktrees/<attemptId>` (containment-checked
-  against symlink/junction escape); registered repos must be real git roots
-  outside the app's data directory; protected paths are enforced on the diff.
+- Validation subprocesses get a **minimal allowlisted environment** (PATH,
+  system dirs, temp, locale — nothing else, so API keys and tokens are
+  excluded by construction, not by blocklist); worker subprocess env strips
+  known secret variables; logs are secret-redacted before storage/display.
+- Attempts are confined to `data/worktrees/<attemptId>` (containment-checked;
+  symlinks/junctions inside the worktree that resolve outside it are detected
+  and fail validation); registered repos must be real git roots outside the
+  app's data directory; protected paths are enforced on the diff with
+  case-correct matching on Windows. `.git` integrity is verified explicitly
+  (gitdir link file, branch, worktree registration) — diff-based path checks
+  alone are NOT treated as protecting `.git`. The task's file *scope* field
+  is advisory only and is labeled as such on approvals (it is not enforced);
+  *protected paths* are enforced.
 - No merge, no push, no LAN exposure, no telemetry.
 
 ## Known limitations
 
-- The real-Codex path awaits an authenticated smoke test on this machine
-  (blocked only on owner credentials); all machinery is exercised by the
-  deterministic runner.
-- One repo-wide write lease per project (no finer-grained scopes yet).
+- One repo-wide write lease per project (no finer-grained scopes yet); the
+  task scope field is advisory, not enforced.
 - Reassignment/handoff is not available for repository attempts (retry with
   a new grant instead); it remains available on the simulated demo path.
-- Grant consumption re-reads repo HEAD just before the transaction; an
-  extremely narrow race with a concurrent local commit remains (documented).
-- The legacy workspace adapters (v0.2 demo path) still use their original
-  spawn strategy; they are demo-only and slated for migration onto the
-  attempt pipeline.
+- Grant consumption re-reads repo state (HEAD, adapter version) just before
+  the consuming transaction; the hash is re-verified from fresh reads inside
+  the transaction, but a concurrent local commit landing in that window
+  surfaces as a 409 rather than being prevented.
+- Validation commands run with the owner's OS privileges — see “Validator
+  execution risk” above; environment isolation and mutation detection reduce
+  but do not eliminate that trust requirement.
+- The legacy workspace adapters (v0.2 demo path) are **quarantined**: their
+  code remains in `server/src/engine/adapters/` but the Engine never
+  instantiates the real ones, sample tasks always run the SimulatedAdapter,
+  and the Antigravity permission bypass defaults to OFF. They stay disabled
+  until migrated onto the hardened attempt pipeline.
+- After a restart during CANCELLING, child-process termination cannot be
+  re-verified; the attempt is settled as cancelled with an explicit note and
+  the worktree is preserved for inspection.
 
 ## Next milestone
 
-Authenticated Codex smoke test + first-class multi-attempt review UX:
-attempt history list per task, diff-vs-diff comparison between attempts, and
-optional per-path write scopes so independent attempts on disjoint areas of
-one repository can run concurrently.
+First-class multi-attempt review UX: attempt history list per task,
+diff-vs-diff comparison between attempts, and optional per-path write scopes
+so independent attempts on disjoint areas of one repository can run
+concurrently.

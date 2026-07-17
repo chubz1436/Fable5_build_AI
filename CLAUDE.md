@@ -26,9 +26,11 @@ deps), vitest. Node ≥ 24, Windows. Owner: Chubz (Taglish is welcome).
 - `server/src/attempts` — `service.ts` (grants, leases, worktree pipeline, recovery), `runners.ts`
   (hardened Codex + deterministic test runner, Windows-aware exec resolver), `validator.ts`.
 - `server/src/git`, `security/auth.ts` — git plumbing (execFile only), loopback+token boundary.
-- `server/src/engine` — legacy simulated demo path + real workspace adapters (Claude Code/Codex/Antigravity).
+- `server/src/engine` — legacy simulated demo path; the real workspace adapters under `adapters/` are
+  QUARANTINED (never instantiated — sample tasks always run the SimulatedAdapter; real execution only
+  via AttemptService).
 - `client/src` — React SPA fed by an SSE store.
-- `server/test` — 71 tests (unit + full vertical-slice integration; deterministic test runner).
+- `server/test` — 85 tests (unit + full vertical-slice integration; deterministic test runner).
 
 ## Run it
 
