@@ -457,13 +457,17 @@ export class AttemptService {
     this.live.set(attemptId, handle);
 
     // P0.12/req-15: the readiness screen must report the same executable
-    // target that was actually used to run the worker.
-    if (worker.readiness && handle.executablePath) {
+    // target that was actually used to run the worker (created if absent).
+    if (handle.executablePath) {
       worker.readiness = {
-        ...worker.readiness,
+        state: 'BUSY',
         executablePath: handle.executablePath,
-        version: probe.version ?? worker.readiness.version,
+        version: probe.version ?? worker.readiness?.version ?? null,
+        authStatus: worker.readiness?.authStatus ?? 'unknown',
         lastCheckAt: nowIso(),
+        lastError: worker.readiness?.lastError ?? null,
+        supportsCancel: true,
+        sandbox: worker.readiness?.sandbox ?? 'workspace-write',
       };
       this.store.upsertWorker(worker);
     }
@@ -563,6 +567,12 @@ export class AttemptService {
       task.progress = 100;
       this.store.upsertTask(task);
       this.freeWorker(attempt.workerId);
+      // the worker actually produced changes → its executable + auth are proven
+      const rw = this.store.worker(attempt.workerId);
+      if (rw?.readiness) {
+        rw.readiness = { ...rw.readiness, state: 'READY', authStatus: 'ok', lastError: null, lastCheckAt: nowIso() };
+        this.store.upsertWorker(rw);
+      }
       this.store.releaseLeases(attemptId);
 
       const status = validation?.status ?? 'UNVERIFIED';

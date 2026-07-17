@@ -331,11 +331,15 @@ export class TestRunner implements WorkerRunner {
 // -- hardened Codex runner --------------------------------------------------------
 
 function classifyCodexExit(code: number | null, text: string): ExitReason {
-  const t = text.toLowerCase();
-  if (/not logged in|please run.*login|authentication|unauthorized|401/.test(t)) return 'auth_required';
-  if (/rate.?limit|429|too many requests/.test(t)) return 'rate_limited';
-  if (/quota|usage limit|insufficient credit/.test(t)) return 'quota_exhausted';
+  // Exit 0 is success, full stop. The keyword scan below only REFINES a
+  // failing exit into a specific reason — scanning a successful session's
+  // stdout would misclassify any run that merely mentions "authentication",
+  // "quota", etc. in the model's own reasoning.
   if (code === 0) return 'success';
+  const t = text.toLowerCase();
+  if (/not logged in|please run\b.*login|unauthorized|\b401\b|error saving auth|login required/.test(t)) return 'auth_required';
+  if (/rate.?limit|\b429\b|too many requests/.test(t)) return 'rate_limited';
+  if (/quota|usage limit|insufficient credit/.test(t)) return 'quota_exhausted';
   if (code === null) return 'unknown';
   return 'failure';
 }

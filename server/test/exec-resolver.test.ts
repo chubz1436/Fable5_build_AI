@@ -147,6 +147,16 @@ describe('CodexRunner launch via the resolved shim', () => {
     expect(fs.existsSync(path.join(worktree, 'sum.js'))).toBe(true);
   });
 
+  it('exit 0 is success even when the session output mentions auth/quota keywords', async () => {
+    const cmd = makeFakeCodex(path.join(tmp(), 'mention dir'));
+    const worktree = tmp('chubz-wt-');
+    const runner = new CodexRunner({ command: cmd, model: '' });
+    const handle = await runner.start(baseLaunch(worktree, { brief: 'Add sum [[MENTION_AUTH]]' }));
+    const outcome = await handle.done;
+    expect(outcome.exitReason).toBe('success'); // NOT auth_required
+    expect(fs.existsSync(path.join(worktree, 'sum.js'))).toBe(true);
+  });
+
   it('reports UNAVAILABLE (not FAILED) when the executable cannot be found', async () => {
     const runner = new CodexRunner({ command: 'definitely-not-codex-xyz-404', model: '' });
     const probe = await runner.probe();

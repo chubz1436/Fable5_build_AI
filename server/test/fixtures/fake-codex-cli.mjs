@@ -31,6 +31,10 @@ async function run() {
   if (done) return;
   done = true;
   process.stdout.write('fake-codex: session started\n');
+  if (brief.includes('[[MENTION_AUTH]]')) {
+    // a successful session that merely MENTIONS auth/quota in its reasoning
+    process.stdout.write('reasoning: no authentication or quota problems; 401/429 not applicable.\n');
+  }
   if (brief.includes('[[SLOW]]')) {
     await new Promise((r) => setTimeout(r, 30_000));
   }
