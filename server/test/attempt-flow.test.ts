@@ -201,8 +201,12 @@ describe('repository-backed attempt vertical slice', () => {
     }, 'worker running with pid', 20000);
 
     await agent.post(`/api/tasks/${task.id}/cancel`).send({}).expect(200);
+    // P0-3: the attempt enters CANCELLING immediately; leases stay held until
+    // child-process termination is proven, then everything settles
+    const during = ctx.store.attemptsForTask(task.id)[0]!;
+    expect(['cancelling', 'cancelled']).toContain(during.state);
+    await waitFor(() => ctx.store.attemptsForTask(task.id)[0]!.state === 'cancelled', 'termination proven', 20000);
     const attempt = ctx.store.attemptsForTask(task.id)[0]!;
-    expect(attempt.state).toBe('cancelled');
     expect(attempt.exitReason).toBe('cancelled');
     expect(ctx.store.task(task.id)!.status).toBe('cancelled');
     expect(ctx.store.activeLeases()).toEqual([]);

@@ -152,9 +152,10 @@ describe('leases (P0.5)', () => {
     const r3 = await agent.post(`/api/approvals/${a3.id}/decision`).send({ decision: 'approve' }).expect(409);
     expect(r3.body.error).toContain('repo');
 
-    // cancel t1 → leases released → t2 can now dispatch
+    // cancel t1 → CANCELLING first; leases are released only once child-process
+    // termination is proven (P0-3), then t2 can dispatch
     await agent.post(`/api/tasks/${t1.id}/cancel`).send({}).expect(200);
-    expect(ctx.store.activeLeases()).toEqual([]);
+    await waitFor(() => ctx.store.activeLeases().length === 0, 'leases released after cancellation finalizes', 20000);
     await agent.post(`/api/approvals/${a2.id}/decision`).send({ decision: 'approve' }).expect(200);
     await waitFor(() => ctx.store.task(t2.id)!.status === 'review', 't2 completes after lease release', 20000);
   });
