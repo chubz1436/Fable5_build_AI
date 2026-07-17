@@ -319,7 +319,9 @@ export function createRoutes(ctx: AppContext): Router {
   router.post('/attempts/:id/cleanup', async (req, res) => {
     const id = param(req, res, 'id');
     if (!id) return;
-    res.json(await attempts.cleanupWorktree(id));
+    const input = body(z.object({ confirmDiscard: z.boolean().optional() }).default({}), req, res);
+    if (!input) return;
+    res.json(await attempts.cleanupWorktree(id, { confirmDiscard: input.confirmDiscard === true }));
   });
 
   // -- misc -------------------------------------------------------------------

@@ -145,3 +145,72 @@ export async function diffUnified(worktree: string, baseCommit: string): Promise
 export async function diffStat(worktree: string, baseCommit: string): Promise<string> {
   return (await mustGit(['diff', '--stat', baseCommit], worktree, 'diff --stat')).trimEnd();
 }
+
+/**
+ * Content snapshot of the worktree (tracked + untracked-not-ignored files):
+ * stages everything, then hashes the index into a tree object. Two identical
+ * hashes prove byte-identical content; a mismatch pinpoints exactly what a
+ * validation run mutated (P0-1). Gitignored files are invisible here — that
+ * IS the explicit ignored-output configuration for build artifacts.
+ */
+export async function writeTreeSnapshot(worktree: string): Promise<string> {
+  await stageAll(worktree);
+  return (await mustGit(['write-tree'], worktree, 'write-tree')).trim();
+}
+
+/** repo-relative paths that differ between two tree snapshots */
+export async function diffTreePaths(worktree: string, treeA: string, treeB: string): Promise<string[]> {
+  if (!/^[0-9a-f]{7,64}$/i.test(treeA) || !/^[0-9a-f]{7,64}$/i.test(treeB)) {
+    throw new GitError('Unsafe tree hash.');
+  }
+  const out = await mustGit(['diff-tree', '-r', '--name-only', treeA, treeB], worktree, 'diff-tree');
+  return out.split('\n').map((l) => l.trim()).filter((l) => l && isSafeRelPath(l));
+}
+
+/**
+ * App-generated checkpoint commit on the attempt branch (P0-2). The index is
+ * already staged by the snapshot; identity is pinned so the commit never
+ * depends on (or leaks) the owner's git config, and hooks/signing are
+ * disabled because a checkpoint must never be blocked by repo-local hooks.
+ * Returns the commit hash, or null when there is nothing to commit.
+ */
+export async function commitCheckpoint(worktree: string, message: string): Promise<string | null> {
+  await stageAll(worktree);
+  const staged = await runGit(['diff', '--cached', '--quiet'], worktree);
+  if (staged.code === 0) return null; // nothing staged → nothing to preserve
+  await mustGit(
+    [
+      '-c', 'user.name=CHUBZ Command Center',
+      '-c', 'user.email=command-center@localhost',
+      '-c', 'commit.gpgsign=false',
+      'commit', '--no-verify', '-m', message,
+    ],
+    worktree,
+    'commit (checkpoint)',
+  );
+  return (await mustGit(['rev-parse', 'HEAD'], worktree, 'rev-parse HEAD')).trim();
+}
+
+/** true when the object exists in the repository's object store */
+export async function commitExists(repo: string, hash: string): Promise<boolean> {
+  if (!/^[0-9a-f]{7,64}$/i.test(hash)) return false;
+  const r = await runGit(['cat-file', '-e', `${hash}^{commit}`], repo);
+  return r.code === 0;
+}
+
+export async function headCommit(worktree: string): Promise<string | null> {
+  const r = await runGit(['rev-parse', 'HEAD'], worktree);
+  return r.code === 0 ? r.stdout.trim() : null;
+}
+
+/** true when `worktreePath` is a registered linked worktree of `repo` */
+export async function isWorktreeRegistered(repo: string, worktreePath: string): Promise<boolean> {
+  const out = await runGit(['worktree', 'list', '--porcelain'], repo);
+  if (out.code !== 0) return false;
+  const want = fs.existsSync(worktreePath) ? fs.realpathSync.native(worktreePath) : worktreePath;
+  const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p).replaceAll('\\', '/');
+  return out.stdout
+    .split('\n')
+    .filter((l) => l.startsWith('worktree '))
+    .some((l) => norm(l.slice('worktree '.length).trim()) === norm(want));
+}

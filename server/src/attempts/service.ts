@@ -5,7 +5,9 @@ import type {
   Approval,
   Attempt,
   AttemptEvidence,
+  AttemptValidation,
   EventLevel,
+  ExecutionSpec,
   OperationKind,
   OperationRecord,
   Project,
@@ -17,32 +19,42 @@ import { assertTransition, LifecycleError } from '../domain/lifecycle';
 import { nowIso, uid } from '../domain/util';
 import {
   branchOfWorktree,
+  commitCheckpoint,
+  commitExists,
   diffNumstat,
   diffStat,
+  diffTreePaths,
   diffUnified,
+  headCommit,
+  revParse,
   stageAll,
   statusPorcelain,
-  revParse,
   worktreeRemove,
+  writeTreeSnapshot,
 } from '../git/git';
 import { ConflictError, type Store } from '../store/store';
+import { findSymlinkEscapes, readGitLinkFile, verifyWorktreeIntegrity } from './integrity';
 import { CodexRunner, TestRunner, type RunnerHandle, type WorkerRunner } from './runners';
 import { runValidation } from './validator';
 
 /**
  * Attempt orchestrator: the authoritative pipeline for repository-backed
  * execution. Every consequential step is a durable Operation; concurrency is
- * enforced by database leases; approvals are exact single-use grants; and
- * evidence comes from the real git worktree.
+ * enforced by database leases; approvals are exact single-use grants bound to
+ * a complete ExecutionSpec; and evidence comes from the real git worktree.
  *
- *   approve → consume grant (tx) → create isolated worktree → run worker →
- *   capture real diff → independent validation → evidence → owner review
+ *   approve → consume grant (tx, spec re-verified) → isolated worktree →
+ *   worker → pre-validation snapshot → independent validation →
+ *   post-validation snapshot + FINAL diff → checkpoint commit →
+ *   evidence → owner review
  *
  * Nothing here ever merges, pushes, or touches the owner's primary tree.
  */
 export class AttemptService {
   private runners = new Map<string, WorkerRunner>();
   private live = new Map<string, RunnerHandle>(); // attemptId → handle
+  /** one cancellation context per attempt, spanning every pipeline phase (P0-3) */
+  private aborts = new Map<string, AbortController>();
 
   constructor(
     private readonly store: Store,
@@ -77,17 +89,75 @@ export class AttemptService {
     return this.runners.get(kind)!;
   }
 
-  private payloadHash(task: Task, workerId: string, adapter: string, project: Project, baseCommit: string): string {
-    const canonical = JSON.stringify({
+  // -- ExecutionSpec (P0-4) ----------------------------------------------------
+
+  /**
+   * The complete canonical description of what a start approval authorizes.
+   * EVERY consequential field is included; the hash of this object is the
+   * approval's payloadHash. Changing any field after the grant invalidates it.
+   */
+  private buildSpec(
+    task: Task,
+    worker: WorkerProfile,
+    runner: WorkerRunner,
+    adapterVersion: string | null,
+    project: Project,
+    baseCommit: string,
+  ): ExecutionSpec {
+    const git = project.git;
+    if (!git || !git.enabled) throw new LifecycleError(`Project “${project.name}” is not an enabled git project.`);
+    return {
       taskId: task.id,
       goal: task.goal,
-      workerId,
-      adapter,
+      scope: [...task.scope],
+      acceptanceCriteria: task.acceptanceCriteria.map((c) => c.text),
+      risk: task.risk,
+      workerId: worker.id,
+      adapter: runner.adapter,
+      model: runner.adapter === 'codex' ? this.config.codexModel || null : null,
+      adapterVersion,
       projectId: project.id,
-      repo: project.git!.canonicalRoot.toLowerCase(),
-      baseBranch: project.git!.baseBranch,
+      repoRoot: process.platform === 'win32' ? git.canonicalRoot.toLowerCase() : git.canonicalRoot,
+      baseBranch: git.baseBranch,
       baseCommit,
-      protectedPaths: [...project.git!.protectedPaths].sort(),
+      protectedPaths: [...git.protectedPaths].sort(),
+      // execution order matters → NOT sorted
+      validationCommands: git.validationCommands.map((c) => ({
+        name: c.name,
+        argv: [...c.argv],
+        required: c.required,
+        timeoutMs: c.timeoutMs,
+      })),
+      sandbox: runner.adapter === 'codex' ? 'workspace-write' : 'none',
+      networkAccess: false,
+      dependencyInstallAllowed: false,
+      workerTimeoutMs: this.config.attemptTimeoutMs,
+      validationDefaultTimeoutMs: this.config.validationTimeoutMs,
+    };
+  }
+
+  private hashSpec(spec: ExecutionSpec): string {
+    return crypto.createHash('sha256').update(JSON.stringify(spec)).digest('hex');
+  }
+
+  /** binds a completion approval to the exact final evidence (P1) */
+  private computeEvidenceHash(
+    attemptId: string,
+    evidence: AttemptEvidence,
+    validation: AttemptValidation | null,
+    checkpointCommit: string | null,
+  ): string {
+    const canonical = JSON.stringify({
+      attemptId,
+      checkpointCommit,
+      validationStatus: validation?.status ?? 'UNVERIFIED',
+      diffSha: crypto.createHash('sha256').update(evidence.diff).digest('hex'),
+      diffStat: evidence.diffStat,
+      gitStatus: evidence.gitStatus,
+      changedFiles: evidence.changedFiles.map((f) => ({ p: f.path, t: f.changeType, a: f.additions, d: f.deletions })),
+      protectedViolations: evidence.protectedViolations,
+      validationMutations: evidence.validationMutations ?? [],
+      symlinkEscapes: evidence.symlinkEscapes ?? [],
     });
     return crypto.createHash('sha256').update(canonical).digest('hex');
   }
@@ -120,7 +190,7 @@ export class AttemptService {
     this.store.updateOperation(op);
   }
 
-  // -- request start: exact approval grant (P0.6) -----------------------------
+  // -- request start: exact approval grant (P0.6 + P0-4) -----------------------
 
   async requestStart(taskId: string, workerId?: string): Promise<{ task: Task; approval: Approval }> {
     const task = this.mustTask(taskId);
@@ -135,9 +205,11 @@ export class AttemptService {
     if (!worker) throw new NotFound('Worker not found.');
     const runner = this.runnerFor(worker); // throws for unsupported workers
 
-    // bind the grant to the repo's CURRENT base commit
+    // bind the grant to the repo's CURRENT base commit + the full spec
+    const probe = await runner.probe();
     const baseCommit = await revParse(project.git!.canonicalRoot, project.git!.baseBranch);
-    const hash = this.payloadHash(task, worker.id, runner.adapter, project, baseCommit);
+    const spec = this.buildSpec(task, worker, runner, probe.version ?? null, project, baseCommit);
+    const hash = this.hashSpec(spec);
 
     task.assignedWorkerId = worker.id;
     task.status = 'awaiting_approval';
@@ -156,7 +228,9 @@ export class AttemptService {
             ? project.git!.validationCommands.map((c) => c.name).join(', ')
             : 'none configured (delivery will be UNVERIFIED)'
         }.` +
-        (project.git!.protectedPaths.length ? ` Protected paths: ${project.git!.protectedPaths.join(', ')}.` : ''),
+        (project.git!.protectedPaths.length ? ` Protected paths: ${project.git!.protectedPaths.join(', ')}.` : '') +
+        ' This grant is bound to the FULL execution spec (goal, scope, criteria, risk, worker, model, repo, base commit, ' +
+        'validation commands, protected paths, timeouts, sandbox) — any change invalidates it.',
       risk: task.risk,
       affectedScope: task.scope,
       recommendedAction: 'approve',
@@ -170,6 +244,7 @@ export class AttemptService {
       workerId: worker.id,
       baseCommit,
       payloadHash: hash,
+      executionSpec: spec,
       expiresAt: new Date(Date.now() + this.config.approvalTtlMs).toISOString(),
       singleUse: true,
       consumedAt: null,
@@ -179,7 +254,7 @@ export class AttemptService {
     return { task, approval };
   }
 
-  // -- decision: consume grant transactionally (P0.5 + P0.6) -------------------
+  // -- decision: consume grant transactionally (P0.5 + P0.6 + P0-4) -------------
 
   async decide(approvalId: string, decision: 'approve' | 'reject', note?: string): Promise<Approval> {
     const approval = this.store.approval(approvalId);
@@ -210,12 +285,12 @@ export class AttemptService {
       return this.store.approval(approval.id)!;
     }
 
-    // re-verify the binding against live repo state BEFORE consuming
+    // re-verify the FULL spec binding against live state BEFORE consuming
     const worker = this.store.worker(approval.workerId ?? '');
     if (!worker) throw new LifecycleError('The approved worker no longer exists.');
     const runner = this.runnerFor(worker);
+    const probe = await runner.probe();
     const freshCommit = await revParse(project.git!.canonicalRoot, project.git!.baseBranch);
-    const freshHash = this.payloadHash(task, worker.id, runner.adapter, project, freshCommit);
 
     // invalidations are PERSISTED (own tx) — an invalid grant never revives
     const current = this.store.approval(approval.id)!;
@@ -228,14 +303,15 @@ export class AttemptService {
       });
       throw new ConflictError('Approval has expired — request a new start approval.');
     }
-    if (current.payloadHash !== freshHash) {
+    const preSpec = this.buildSpec(this.mustTask(approval.taskId), worker, runner, probe.version ?? null, this.mustGitProject(task), freshCommit);
+    if (current.payloadHash !== this.hashSpec(preSpec)) {
       this.store.tx(() => {
         current.status = 'expired';
         current.decidedAt = nowIso();
-        current.decisionNote = `Invalidated: the authorized action changed (repo moved ${current.baseCommit?.slice(0, 8)} → ${freshCommit.slice(0, 8)} or task edited).`;
+        current.decisionNote = `Invalidated: the authorized execution spec changed (repo moved ${current.baseCommit?.slice(0, 8)} → ${freshCommit.slice(0, 8)}, or the task/project/validation configuration was edited after the grant).`;
         this.store.upsertApproval(current);
       });
-      throw new ConflictError('The approved action changed (base commit or task) — request a new approval.');
+      throw new ConflictError('The approved execution spec changed — request a new approval.');
     }
 
     const attemptId = uid('att');
@@ -264,16 +340,30 @@ export class AttemptService {
       delivery: null,
       worktreeCleanedAt: null,
       worktreeHealth: null,
+      executionSpec: preSpec,
+      checkpointCommit: null,
+      evidenceHash: null,
     };
 
-    // single transaction: consume grant + create attempt + acquire all leases
+    // single transaction: RE-READ everything, recompute the spec hash, consume
+    // grant, create attempt, acquire all leases (P0-4)
     this.store.tx(() => {
-      // atomic re-check inside the consuming transaction (pure race guard)
       const fresh = this.store.approval(approval.id)!;
       if (fresh.status !== 'pending') throw new ConflictError(`Approval already ${fresh.status}.`);
-      if (fresh.payloadHash !== freshHash) {
-        throw new ConflictError('The approved action changed — request a new approval.');
+
+      const txTask = this.store.task(approval.taskId);
+      if (!txTask) throw new NotFound(`Task ${approval.taskId} not found`);
+      const txProject = txTask.gitProjectId ? this.store.project(txTask.gitProjectId) : undefined;
+      if (!txProject?.git?.enabled) throw new LifecycleError('The task is no longer bound to an enabled git project.');
+      const txWorker = this.store.worker(worker.id);
+      if (!txWorker) throw new LifecycleError('The approved worker no longer exists.');
+
+      const txSpec = this.buildSpec(txTask, txWorker, runner, probe.version ?? null, txProject, freshCommit);
+      if (fresh.payloadHash !== this.hashSpec(txSpec)) {
+        throw new ConflictError('The approved execution spec changed — request a new approval.');
       }
+      attempt.executionSpec = txSpec;
+
       fresh.status = 'approved';
       fresh.decidedAt = nowIso();
       fresh.decisionNote = note ?? null;
@@ -287,32 +377,33 @@ export class AttemptService {
       this.store.acquireLeases(
         attemptId,
         [
-          { kind: 'task', resourceKey: task.id },
-          { kind: 'worker', resourceKey: worker.id },
-          { kind: 'repo', resourceKey: project.id },
+          { kind: 'task', resourceKey: txTask.id },
+          { kind: 'worker', resourceKey: txWorker.id },
+          { kind: 'repo', resourceKey: txProject.id },
         ],
         this.config.leaseTtlMs,
       );
 
-      assertTransition(task.status, 'running');
-      task.status = 'running';
-      task.attempts += 1;
-      task.activeAttemptId = attemptId;
-      task.blockReason = null;
-      task.progress = 5;
-      task.phase = 'Creating isolated worktree';
-      task.runPlan = null;
-      if (!task.startedAt) task.startedAt = nowIso();
-      this.store.upsertTask(task);
+      assertTransition(txTask.status, 'running');
+      txTask.status = 'running';
+      txTask.attempts += 1;
+      txTask.activeAttemptId = attemptId;
+      txTask.blockReason = null;
+      txTask.progress = 5;
+      txTask.phase = 'Creating isolated worktree';
+      txTask.runPlan = null;
+      if (!txTask.startedAt) txTask.startedAt = nowIso();
+      this.store.upsertTask(txTask);
 
-      worker.availability = 'busy';
-      worker.currentTaskId = task.id;
-      this.store.upsertWorker(worker);
+      txWorker.availability = 'busy';
+      txWorker.currentTaskId = txTask.id;
+      this.store.upsertWorker(txWorker);
     });
 
     this.event('approval.approved', `Owner approved: ${approval.title}`, task.id, 'success', { attemptId });
     this.event('run.started', `${worker.name} attempt ${attemptId} started (grant ${approval.id.slice(-6)}, base ${freshCommit.slice(0, 8)})`, task.id, 'info', { attemptId });
 
+    this.aborts.set(attemptId, new AbortController());
     void this.pipeline(attemptId).catch((err) => this.failAttempt(attemptId, 'failure', `Pipeline error: ${(err as Error).message}`));
     return this.store.approval(approval.id)!;
   }
@@ -322,9 +413,56 @@ export class AttemptService {
     const attempt = approval.attemptId ? this.store.attempt(approval.attemptId) : undefined;
     if (!attempt) throw new LifecycleError('Completion approval has no attempt.');
 
+    // P1: re-verify evidence integrity BEFORE consuming an acceptance
+    if (decision === 'approve') {
+      const fresh = this.store.attempt(attempt.id)!;
+      const invalidate = (reason: string): never => {
+        this.store.tx(() => {
+          const a = this.store.approval(approval.id)!;
+          if (a.status === 'pending') {
+            a.status = 'expired';
+            a.decidedAt = nowIso();
+            a.decisionNote = reason;
+            this.store.upsertApproval(a);
+          }
+        });
+        throw new ConflictError(reason);
+      };
+      if (!fresh.evidence) invalidate('Delivery evidence is missing — re-validate before accepting.');
+      const expected = this.computeEvidenceHash(fresh.id, fresh.evidence!, fresh.validation, fresh.checkpointCommit ?? null);
+      if (approval.payloadHash !== expected) {
+        invalidate('Delivery evidence changed since this approval was issued — review the new evidence and approve again.');
+      }
+      const project = this.store.project(fresh.projectId);
+      if (fresh.checkpointCommit && project?.git) {
+        if (!(await commitExists(project.git.canonicalRoot, fresh.checkpointCommit))) {
+          invalidate(`Checkpoint commit ${fresh.checkpointCommit.slice(0, 10)} is missing from the repository — the delivery is no longer durable.`);
+        }
+        if (fresh.worktreePath && !fresh.worktreeCleanedAt && fs.existsSync(fresh.worktreePath)) {
+          const head = await headCommit(fresh.worktreePath);
+          let status: string | null = null;
+          try {
+            status = await statusPorcelain(fresh.worktreePath);
+          } catch {
+            status = null;
+          }
+          if (head !== fresh.checkpointCommit || status !== '') {
+            invalidate('The attempt worktree changed after this approval was issued — re-run validation to refresh the evidence, then approve again.');
+          }
+        }
+      }
+    }
+
     this.store.tx(() => {
       const fresh = this.store.approval(approval.id)!;
       if (fresh.status !== 'pending') throw new ConflictError(`Approval already ${fresh.status}`);
+      if (decision === 'approve') {
+        // atomic re-check inside the consuming transaction (P1)
+        const a2 = this.store.attempt(attempt.id)!;
+        if (!a2.evidence || fresh.payloadHash !== this.computeEvidenceHash(a2.id, a2.evidence, a2.validation, a2.checkpointCommit ?? null)) {
+          throw new ConflictError('Delivery evidence changed — approve the refreshed completion request instead.');
+        }
+      }
       fresh.status = decision === 'approve' ? 'approved' : 'rejected';
       fresh.decidedAt = nowIso();
       fresh.decisionNote = note ?? null;
@@ -359,7 +497,7 @@ export class AttemptService {
     this.event(
       decision === 'approve' ? 'task.completed' : 'task.changes_requested',
       decision === 'approve'
-        ? `Owner accepted delivery — branch ${attempt.branchName} remains unmerged for review/merge by the owner`
+        ? `Owner accepted delivery — branch ${attempt.branchName} (checkpoint ${attempt.checkpointCommit?.slice(0, 10) ?? 'n/a'}) remains unmerged for review/merge by the owner`
         : `Owner requested correction on attempt ${attempt.id}`,
       task.id,
       decision === 'approve' ? 'success' : 'warning',
@@ -383,12 +521,22 @@ export class AttemptService {
     this.store.addEvent({ type: 'run.phase', taskId: attempt.taskId, message: label, data: { attemptId: attempt.id } });
   }
 
+  /** true once the owner requested cancellation for this attempt (P0-3) */
+  private cancelRequested(attemptId: string): boolean {
+    if (this.aborts.get(attemptId)?.signal.aborted) return true;
+    return this.store.attempt(attemptId)?.state === 'cancelling';
+  }
+
   private async pipeline(attemptId: string): Promise<void> {
     let attempt = this.store.attempt(attemptId)!;
     const task = this.mustTask(attempt.taskId);
     const project = this.store.project(attempt.projectId)!;
     const worker = this.store.worker(attempt.workerId)!;
     const repo = project.git!.canonicalRoot;
+    const signal = this.aborts.get(attemptId)?.signal;
+
+    // cancellation checkpoint: cancelled before any side effect → nothing runs
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
 
     // 1) isolated worktree (P0.7)
     const branch = `cc/${attemptId}`;
@@ -407,20 +555,27 @@ export class AttemptService {
       this.finishOp(wtOp, 'succeeded', 0);
     } catch (err) {
       this.finishOp(wtOp, 'failed', null, (err as Error).message);
+      if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
       return this.failAttempt(attemptId, 'failure', `Worktree creation failed: ${(err as Error).message}`);
     }
+    const gitLinkAtCreation = readGitLinkFile(worktreePath);
     attempt = this.store.attempt(attemptId)!;
     attempt.worktreePath = worktreePath;
     attempt.branchName = branch;
     attempt.worktreeHealth = 'ok';
     this.store.updateAttempt(attempt);
     this.log(attempt, `Isolated worktree ready: ${worktreePath} (branch ${branch} @ ${attempt.baseCommit.slice(0, 8)})`);
+
+    // cancellation checkpoint: cancelled during creating_worktree must NEVER
+    // proceed to worker launch (P0-3)
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
     this.phase(attempt, 'Worker running', 20);
 
     // 2) worker execution (P0.8)
     const runner = this.runnerFor(worker);
     const probe = await runner.probe();
     const brief = this.buildBrief(task, project);
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
     const startOp = this.op(attemptId, 'start_worker', `worker:${attemptId}`, JSON.stringify({ adapter: runner.adapter, executable: probe.path }), this.config.attemptTimeoutMs);
 
     attempt = this.store.attempt(attemptId)!;
@@ -455,6 +610,8 @@ export class AttemptService {
     if (handle.executablePath) attempt.executablePath = handle.executablePath;
     this.store.updateAttempt(attempt);
     this.live.set(attemptId, handle);
+    // a cancel may have raced the spawn — kill immediately, then await close
+    if (this.cancelRequested(attemptId)) handle.cancel();
 
     // P0.12/req-15: the readiness screen must report the same executable
     // target that was actually used to run the worker (created if absent).
@@ -472,92 +629,252 @@ export class AttemptService {
       this.store.upsertWorker(worker);
     }
 
-    const outcome = await handle.done;
+    const outcome = await handle.done; // resolves only after process close
     this.live.delete(attemptId);
     this.finishOp(startOp, outcome.exitReason === 'success' ? 'succeeded' : outcome.exitReason === 'timeout' ? 'timeout' : 'failed', outcome.exitCode, outcome.error);
 
-    // cancelled while running → cancel() already settled the attempt/task
-    if (this.store.attempt(attemptId)!.state === 'cancelled') return;
+    // cancellation checkpoint: worker tree is proven dead at this point
+    if (this.cancelRequested(attemptId) || outcome.exitReason === 'cancelled') {
+      return this.finalizeCancellation(attemptId);
+    }
 
     if (outcome.exitReason !== 'success') {
       return this.failAttempt(attemptId, outcome.exitReason, outcome.error ?? 'Worker failed.', outcome.logTail);
     }
 
-    // 3) real diff capture (P0.10)
+    // 3) post-worker git integrity check (P1)
+    const intOp1 = this.op(attemptId, 'integrity_check', `integrity:${attemptId}:post_worker`, JSON.stringify({ phase: 'post_worker' }));
+    const issues1 = await verifyWorktreeIntegrity({ repo, worktreePath, expectedBranch: branch, baseCommit: attempt.baseCommit, expectedGitLink: gitLinkAtCreation });
+    this.finishOp(intOp1, issues1.length ? 'failed' : 'succeeded', null, issues1.length ? issues1.map((i) => `${i.check}: ${i.detail}`).join('; ') : null);
+    if (issues1.length) {
+      return this.failAttempt(attemptId, 'failure', `Worktree integrity violated after worker run: ${issues1.map((i) => `${i.check} (${i.detail})`).join('; ')}`, outcome.logTail);
+    }
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
+
+    // 4) pre-validation snapshot + diff capture (P0-1)
     this.phase(attempt, 'Capturing git diff', 85);
     const diffOp = this.op(attemptId, 'capture_diff', `diff:${attemptId}`, JSON.stringify(['git', 'add', '-A', '&&', 'git', 'diff', attempt.baseCommit]));
     let evidence: AttemptEvidence;
+    let preValidationTree: string;
     try {
-      const gitStatus = await statusPorcelain(worktreePath);
-      await stageAll(worktreePath);
-      const files = await diffNumstat(worktreePath, attempt.baseCommit);
-      const stat = await diffStat(worktreePath, attempt.baseCommit);
-      let diff = await diffUnified(worktreePath, attempt.baseCommit);
-      const truncated = diff.length > this.config.maxDiffBytes;
-      if (truncated) diff = diff.slice(0, this.config.maxDiffBytes);
-      const violations = files
-        .map((f) => f.path)
-        .filter((p) => project.git!.protectedPaths.some((pp) => p === pp || p.startsWith(`${pp}/`)));
-      evidence = {
-        changedFiles: files.map((f) => ({ path: f.path, changeType: f.changeType, additions: f.additions, deletions: f.deletions, summary: `${f.changeType} by ${worker.name}` })),
-        diffStat: stat,
-        diff,
-        diffTruncated: truncated,
-        gitStatus,
-        protectedViolations: violations,
-        workerLogTail: outcome.logTail,
-      };
+      preValidationTree = await writeTreeSnapshot(worktreePath);
+      evidence = await this.captureEvidence(worktreePath, attempt.baseCommit, project, worker.name, outcome.logTail);
+      evidence.preValidationTree = preValidationTree;
       this.finishOp(diffOp, 'succeeded', 0);
-      this.log(attempt, `Diff captured: ${files.length} file(s) changed${violations.length ? ` — ⚠ ${violations.length} protected-path violation(s)!` : ''}`, violations.length ? 'error' : 'info');
+      this.log(attempt, `Diff captured: ${evidence.changedFiles.length} file(s) changed${evidence.protectedViolations.length ? ` — ⚠ ${evidence.protectedViolations.length} protected-path violation(s)!` : ''}`, evidence.protectedViolations.length ? 'error' : 'info');
     } catch (err) {
       this.finishOp(diffOp, 'failed', null, (err as Error).message);
+      if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
       return this.failAttempt(attemptId, 'failure', `Diff capture failed: ${(err as Error).message}`);
     }
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
 
-    // 4) independent validation (P0.9)
+    // 5) independent validation (P0.9) with cancellation + env isolation
     this.phase(attempt, 'Independent validation', 90);
     attempt = this.store.attempt(attemptId)!;
-    attempt.state = 'validating';
-    attempt.evidence = evidence;
-    this.store.updateAttempt(attempt);
-    const t = this.store.task(attempt.taskId)!;
-    assertTransition(t.status, 'verifying');
-    t.status = 'verifying';
-    this.store.upsertTask(t);
-    this.event('verify.started', `Independent validation running in the attempt worktree (${project.git!.validationCommands.length} command(s))`, t.id, 'info', { attemptId });
+    if (attempt.state !== 'cancelling') {
+      attempt.state = 'validating';
+      attempt.evidence = evidence;
+      this.store.updateAttempt(attempt);
+      const t = this.store.task(attempt.taskId)!;
+      assertTransition(t.status, 'verifying');
+      t.status = 'verifying';
+      this.store.upsertTask(t);
+    }
+    this.event('verify.started', `Independent validation running in the attempt worktree (${project.git!.validationCommands.length} command(s))`, task.id, 'info', { attemptId });
 
     const valOp = this.op(attemptId, 'run_validation', `validate:${attemptId}:1`, JSON.stringify(project.git!.validationCommands.map((c) => c.argv)));
-    const validation = await runValidation(project.git!.validationCommands, worktreePath, (line, level) =>
-      this.log(this.store.attempt(attemptId)!, line, level),
+    const validation = await runValidation(
+      project.git!.validationCommands,
+      worktreePath,
+      (line, level) => this.log(this.store.attempt(attemptId)!, line, level),
+      signal,
     );
-    if (evidence.protectedViolations.length > 0) {
+    if (this.cancelRequested(attemptId)) {
+      this.finishOp(valOp, 'failed', null, 'Cancelled by owner.');
+      return this.finalizeCancellation(attemptId);
+    }
+
+    // 6) post-validation snapshot: detect EVERY validation-produced
+    // modification and recapture the FINAL evidence (P0-1)
+    try {
+      const postValidationTree = await writeTreeSnapshot(worktreePath);
+      const mutations = postValidationTree === preValidationTree ? [] : await diffTreePaths(worktreePath, preValidationTree, postValidationTree);
+      if (mutations.length > 0) {
+        // validation changed the worktree → the earlier diff is stale; the
+        // delivery evidence MUST represent the actual final worktree
+        evidence = await this.captureEvidence(worktreePath, attempt.baseCommit, project, worker.name, outcome.logTail);
+        evidence.preValidationTree = preValidationTree;
+        this.log(this.store.attempt(attemptId)!, `⚠ validation modified ${mutations.length} file(s): ${mutations.slice(0, 10).join(', ')}${mutations.length > 10 ? ', …' : ''}`, 'error');
+      }
+      evidence.postValidationTree = postValidationTree;
+      evidence.validationMutations = mutations;
+    } catch (err) {
+      this.finishOp(valOp, 'failed', null, (err as Error).message);
+      return this.failAttempt(attemptId, 'failure', `Post-validation snapshot failed: ${(err as Error).message}`);
+    }
+
+    // 7) post-validation git integrity (P1)
+    const intOp2 = this.op(attemptId, 'integrity_check', `integrity:${attemptId}:post_validation`, JSON.stringify({ phase: 'post_validation' }));
+    const issues2 = await verifyWorktreeIntegrity({ repo, worktreePath, expectedBranch: branch, baseCommit: attempt.baseCommit, expectedGitLink: gitLinkAtCreation });
+    this.finishOp(intOp2, issues2.length ? 'failed' : 'succeeded', null, issues2.length ? issues2.map((i) => `${i.check}: ${i.detail}`).join('; ') : null);
+
+    this.applyIntegritySteps(validation, evidence, worktreePath, issues2.map((i) => `${i.check}: ${i.detail}`));
+    this.finishOp(valOp, validation.status === 'FAILED' ? 'failed' : 'succeeded', null, validation.status === 'FAILED' ? 'required validation failed' : null);
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
+
+    // 8) durable checkpoint commit on the attempt branch (P0-2): the delivery
+    // must be lossless BEFORE it becomes reviewable
+    let checkpoint: string | null = null;
+    const ckOp = this.op(attemptId, 'checkpoint', `checkpoint:${attemptId}:1`, JSON.stringify(['git', 'commit', '--no-verify', '-m', `checkpoint attempt ${attemptId}`]));
+    try {
+      checkpoint = await commitCheckpoint(worktreePath, `Command Center checkpoint — attempt ${attemptId}\n\nApp-generated durable checkpoint of the validated delivery. Never merged or pushed by the Command Center.`);
+      evidence.checkpointCommit = checkpoint;
+      this.finishOp(ckOp, 'succeeded', 0, null);
+      if (checkpoint) this.log(this.store.attempt(attemptId)!, `Durable checkpoint committed on ${branch}: ${checkpoint.slice(0, 10)}`);
+      else this.log(this.store.attempt(attemptId)!, 'No changes to checkpoint (empty delivery).');
+    } catch (err) {
+      this.finishOp(ckOp, 'failed', null, (err as Error).message);
+      return this.failAttempt(attemptId, 'failure', `Checkpoint commit failed — refusing to offer a non-durable delivery: ${(err as Error).message}`);
+    }
+    if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
+
+    // 9) delivery review (P0.10)
+    this.settleForReview(attemptId, validation, evidence, checkpoint);
+  }
+
+  /**
+   * Capture real evidence from the worktree: git status, staged diff vs the
+   * base commit, protected-path violations (case-correct on Windows) and
+   * symlink/junction escapes. Called both pre- and post-validation; the FINAL
+   * call is what the owner reviews.
+   */
+  private async captureEvidence(
+    worktree: string,
+    baseCommit: string,
+    project: Project,
+    workerName: string,
+    logTail: string[],
+  ): Promise<AttemptEvidence> {
+    const gitStatus = await statusPorcelain(worktree);
+    await stageAll(worktree);
+    const files = await diffNumstat(worktree, baseCommit);
+    const stat = await diffStat(worktree, baseCommit);
+    let diff = await diffUnified(worktree, baseCommit);
+    const truncated = diff.length > this.config.maxDiffBytes;
+    if (truncated) diff = diff.slice(0, this.config.maxDiffBytes);
+    // case-correct on Windows: NTFS is case-insensitive, so path comparison
+    // must be too — otherwise "SRC/secret" bypasses a "src/secret" rule (P1)
+    const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p).replace(/\/+$/, '');
+    const violations = files
+      .map((f) => f.path)
+      .filter((p) => project.git!.protectedPaths.some((pp) => norm(p) === norm(pp) || norm(p).startsWith(`${norm(pp)}/`)));
+    const symlinkEscapes = findSymlinkEscapes(worktree);
+    return {
+      changedFiles: files.map((f) => ({ path: f.path, changeType: f.changeType, additions: f.additions, deletions: f.deletions, summary: `${f.changeType} by ${workerName}` })),
+      diffStat: stat,
+      diff,
+      diffTruncated: truncated,
+      gitStatus,
+      protectedViolations: violations,
+      workerLogTail: logTail,
+      symlinkEscapes,
+    };
+  }
+
+  /**
+   * Fold integrity findings into the validation verdict: protected-path
+   * violations, validation-produced mutations (P0-1), symlink escapes and git
+   * integrity issues each add a FAILED required step. An attempt with any of
+   * these is NEVER marked VERIFIED.
+   */
+  private applyIntegritySteps(validation: AttemptValidation, evidence: AttemptEvidence, worktree: string, gitIssues: string[]): void {
+    const addFailed = (name: string, outputTail: string[]): void => {
       validation.steps.push({
         id: uid('vstep'),
-        name: 'protected-paths',
+        name,
         argv: [],
-        cwd: worktreePath,
+        cwd: worktree,
         required: true,
         startedAt: nowIso(),
         endedAt: nowIso(),
         timeoutMs: 0,
         exitCode: null,
         status: 'FAILED',
-        outputTail: evidence.protectedViolations.map((p) => `protected path modified: ${p}`),
+        outputTail: outputTail.slice(0, 30),
       });
       validation.status = 'FAILED';
+    };
+    if (evidence.protectedViolations.length > 0) {
+      addFailed('protected-paths', evidence.protectedViolations.map((p) => `protected path modified: ${p}`));
     }
-    this.finishOp(valOp, validation.status === 'FAILED' ? 'failed' : 'succeeded', null, validation.status === 'FAILED' ? 'required validation failed' : null);
-
-    // 5) delivery review (P0.10)
-    this.settleForReview(attemptId, validation);
+    if ((evidence.validationMutations?.length ?? 0) > 0) {
+      addFailed('post-validation-integrity', evidence.validationMutations!.map((p) => `validation modified: ${p}`));
+    }
+    if ((evidence.symlinkEscapes?.length ?? 0) > 0) {
+      addFailed('symlink-containment', evidence.symlinkEscapes!.map((p) => `link escapes the worktree: ${p}`));
+    }
+    if (gitIssues.length > 0) {
+      addFailed('git-integrity', gitIssues);
+    }
   }
 
-  private settleForReview(attemptId: string, validation: Attempt['validation']): void {
+  /** the completion approval bound to the exact final evidence (P1) */
+  private issueCompletionApproval(task: Task, attempt: Attempt, validation: AttemptValidation | null): Approval {
+    const status = validation?.status ?? 'UNVERIFIED';
+    const approval: Approval = {
+      id: uid('appr'),
+      taskId: task.id,
+      type: 'completion',
+      title: `Accept delivery of “${task.title}”`,
+      description:
+        `Attempt ${attempt.id} finished on branch ${attempt.branchName}. ` +
+        `${attempt.evidence?.changedFiles.length ?? 0} file(s) changed (real git diff attached, captured AFTER validation). ` +
+        `Independent validation: ${status}. ` +
+        (attempt.checkpointCommit
+          ? `The delivery is durably checkpointed at ${attempt.checkpointCommit.slice(0, 10)} on the attempt branch. `
+          : 'The delivery contains no changes (nothing to checkpoint). ') +
+        'Accepting does NOT merge or push — the branch stays for your review. ' +
+        'Note: the task file scope is advisory (NOT enforced); protected paths and worktree containment ARE enforced.',
+      risk: task.risk,
+      affectedScope: attempt.evidence?.changedFiles.map((f) => f.path).slice(0, 20) ?? [],
+      recommendedAction: status === 'VERIFIED' ? 'approve' : 'reject',
+      recommendationReason:
+        status === 'VERIFIED'
+          ? 'All required validation commands passed in the attempt worktree, and no integrity check failed.'
+          : status === 'UNVERIFIED'
+            ? 'No validation commands are configured — inspect the diff yourself before accepting.'
+            : status === 'PARTIAL'
+              ? 'Optional validation steps failed — inspect the results.'
+              : 'Required validation or an integrity check FAILED — delivery cannot be considered verified.',
+      status: 'pending',
+      createdAt: nowIso(),
+      decidedAt: null,
+      decisionNote: null,
+      attemptId: attempt.id,
+      projectId: attempt.projectId,
+      workerId: attempt.workerId,
+      baseCommit: attempt.baseCommit,
+      payloadHash: attempt.evidenceHash ?? null,
+      executionSpec: null,
+      expiresAt: null,
+      singleUse: true,
+      consumedAt: null,
+    };
+    this.store.upsertApproval(approval);
+    return approval;
+  }
+
+  private settleForReview(attemptId: string, validation: Attempt['validation'], evidence: AttemptEvidence, checkpointCommit: string | null): void {
     const attempt = this.store.attempt(attemptId)!;
     const task = this.mustTask(attempt.taskId);
+    this.aborts.delete(attemptId);
     this.store.tx(() => {
       attempt.state = 'ready_for_review';
       attempt.validation = validation;
+      attempt.evidence = evidence;
+      attempt.checkpointCommit = checkpointCommit;
+      attempt.evidenceHash = this.computeEvidenceHash(attemptId, evidence, validation, checkpointCommit);
       attempt.exitReason = 'success';
       attempt.endedAt = nowIso();
       this.store.updateAttempt(attempt);
@@ -574,50 +891,19 @@ export class AttemptService {
         this.store.upsertWorker(rw);
       }
       this.store.releaseLeases(attemptId);
-
-      const status = validation?.status ?? 'UNVERIFIED';
-      const approval: Approval = {
-        id: uid('appr'),
-        taskId: task.id,
-        type: 'completion',
-        title: `Accept delivery of “${task.title}”`,
-        description:
-          `Attempt ${attempt.id} finished on branch ${attempt.branchName}. ` +
-          `${attempt.evidence?.changedFiles.length ?? 0} file(s) changed (real git diff attached). ` +
-          `Independent validation: ${status}. Accepting does NOT merge or push — the branch stays for your review.`,
-        risk: task.risk,
-        affectedScope: attempt.evidence?.changedFiles.map((f) => f.path).slice(0, 20) ?? [],
-        recommendedAction: status === 'VERIFIED' ? 'approve' : 'reject',
-        recommendationReason:
-          status === 'VERIFIED'
-            ? 'All required validation commands passed in the attempt worktree.'
-            : status === 'UNVERIFIED'
-              ? 'No validation commands are configured — inspect the diff yourself before accepting.'
-              : status === 'PARTIAL'
-                ? 'Optional validation steps failed — inspect the results.'
-                : 'Required validation FAILED — delivery cannot be considered verified.',
-        status: 'pending',
-        createdAt: nowIso(),
-        decidedAt: null,
-        decisionNote: null,
-        attemptId: attempt.id,
-        projectId: attempt.projectId,
-        workerId: attempt.workerId,
-        baseCommit: attempt.baseCommit,
-        payloadHash: null,
-        expiresAt: null,
-        singleUse: true,
-        consumedAt: null,
-      };
-      this.store.upsertApproval(approval);
+      this.issueCompletionApproval(task, attempt, validation);
     });
     this.event('verify.passed', `Attempt ready for review — validation: ${validation?.status ?? 'UNVERIFIED'}`, task.id, validation?.status === 'FAILED' ? 'warning' : 'success', { attemptId });
-    this.event('review.ready', `Delivery ready: real diff + validation evidence attached (branch ${attempt.branchName})`, task.id, 'success', { attemptId });
+    this.event('review.ready', `Delivery ready: final post-validation diff + validation evidence attached (branch ${attempt.branchName}${checkpointCommit ? `, checkpoint ${checkpointCommit.slice(0, 10)}` : ''})`, task.id, 'success', { attemptId });
   }
 
   private failAttempt(attemptId: string, exitReason: Attempt['exitReason'], reason: string, logTail: string[] = []): void {
     const attempt = this.store.attempt(attemptId);
-    if (!attempt || ['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
+    if (!attempt) return;
+    if (attempt.state === 'cancelling') return this.finalizeCancellation(attemptId);
+    if (['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
+    this.live.delete(attemptId);
+    this.aborts.delete(attemptId);
     const task = this.store.task(attempt.taskId);
     this.store.tx(() => {
       attempt.state = exitReason === 'timeout' ? 'timeout' : 'failed';
@@ -680,25 +966,18 @@ export class AttemptService {
 
   // -- owner actions -------------------------------------------------------------
 
+  /**
+   * Authoritative cancellation (P0-3): the attempt enters CANCELLING, the
+   * shared AbortController fires, live process trees are killed — but leases,
+   * the worker and the task are only settled by finalizeCancellation() once
+   * the pipeline has PROVEN that every child process terminated.
+   */
   cancel(taskId: string): Task {
     const task = this.mustTask(taskId);
     const attempt = task.activeAttemptId ? this.store.attempt(task.activeAttemptId) : undefined;
     const handle = attempt ? this.live.get(attempt.id) : undefined;
-    if (attempt && ['creating_worktree', 'running', 'validating'].includes(attempt.state)) {
-      const cancelOp = this.op(attempt.id, 'cancel_worker', `cancel:${attempt.id}`, null);
-      if (handle) handle.cancel();
-      this.store.tx(() => {
-        attempt.state = 'cancelled';
-        attempt.exitReason = 'cancelled';
-        attempt.endedAt = nowIso();
-        attempt.failureReason = 'Cancelled by owner.';
-        this.store.updateAttempt(attempt);
-        this.store.releaseLeases(attempt.id);
-        this.freeWorker(attempt.workerId);
-      });
-      this.finishOp(cancelOp, 'succeeded');
-    }
-    // expire pending approvals for the task
+
+    // expire pending approvals for the task in every case
     for (const appr of this.store.approvalsForTask(task.id)) {
       if (appr.status === 'pending') {
         appr.status = 'expired';
@@ -707,11 +986,65 @@ export class AttemptService {
         this.store.upsertApproval(appr);
       }
     }
+
+    if (attempt && attempt.state === 'cancelling') {
+      return this.store.task(taskId)!; // already cancelling; nothing new to do
+    }
+
+    if (attempt && ['creating_worktree', 'running', 'validating'].includes(attempt.state)) {
+      this.op(attempt.id, 'cancel_worker', `cancel:${attempt.id}`, null);
+      this.store.tx(() => {
+        const a = this.store.attempt(attempt.id)!;
+        a.state = 'cancelling';
+        a.failureReason = 'Cancellation requested by owner — stopping worker/validation processes.';
+        this.store.updateAttempt(a);
+        const t = this.store.task(taskId)!;
+        t.phase = 'Cancelling — waiting for process termination';
+        this.store.upsertTask(t);
+      });
+      // fire the shared cancellation context; every pipeline phase checks it
+      this.aborts.get(attempt.id)?.abort();
+      handle?.cancel();
+      this.event('task.cancelling', `Owner cancelled “${task.title}” — terminating processes; leases stay held until termination is proven`, task.id, 'warning', { attemptId: attempt.id });
+      return this.store.task(taskId)!;
+    }
+
+    // no active attempt → immediate, honest cancel
     task.status = 'cancelled';
     task.phase = null;
     this.store.upsertTask(task);
-    this.event('task.cancelled', `Owner cancelled “${task.title}” (worker process tree terminated)`, task.id, 'warning');
-    return task;
+    this.event('task.cancelled', `Owner cancelled “${task.title}”`, task.id, 'warning');
+    return this.store.task(taskId)!;
+  }
+
+  /**
+   * Terminal step of cancellation: called ONLY from pipeline checkpoints (or
+   * recovery), i.e. after every spawned process has provably closed. Releases
+   * leases, frees the worker and settles the task.
+   */
+  private finalizeCancellation(attemptId: string): void {
+    const attempt = this.store.attempt(attemptId);
+    if (!attempt || ['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
+    this.live.delete(attemptId);
+    this.aborts.delete(attemptId);
+    const task = this.store.task(attempt.taskId);
+    this.store.tx(() => {
+      attempt.state = 'cancelled';
+      attempt.exitReason = 'cancelled';
+      attempt.endedAt = nowIso();
+      attempt.failureReason = 'Cancelled by owner. All worker/validation processes were terminated; the worktree is preserved.';
+      this.store.updateAttempt(attempt);
+      this.store.releaseLeases(attemptId);
+      this.freeWorker(attempt.workerId);
+      if (task && !['completed', 'cancelled', 'failed'].includes(task.status)) {
+        task.status = 'cancelled';
+        task.phase = null;
+        this.store.upsertTask(task);
+      }
+    });
+    const cancelOp = this.store.operationsForAttempt(attemptId).find((o) => o.kind === 'cancel_worker' && o.status === 'running');
+    if (cancelOp) this.finishOp(cancelOp, 'succeeded');
+    if (task) this.event('task.cancelled', `Cancellation of attempt ${attemptId} complete — all processes terminated, leases released, worktree preserved`, task.id, 'warning', { attemptId });
   }
 
   /** re-run ONLY validation (never the worker) in the preserved worktree */
@@ -723,41 +1056,138 @@ export class AttemptService {
       throw new LifecycleError(`Cannot re-validate an attempt in state ${attempt.state}.`);
     }
     const project = this.store.project(attempt.projectId)!;
+    const worktree = attempt.worktreePath;
+    const worker = this.store.worker(attempt.workerId);
+
+    // P1: a revalidation ALWAYS invalidates any pending completion approval —
+    // the evidence it was bound to is about to be replaced
+    this.store.tx(() => {
+      for (const appr of this.store.approvalsForTask(attempt.taskId)) {
+        if (appr.type === 'completion' && appr.status === 'pending' && appr.attemptId === attemptId) {
+          appr.status = 'expired';
+          appr.decidedAt = nowIso();
+          appr.decisionNote = 'Superseded by re-validation — a new completion approval will be issued with the refreshed evidence.';
+          this.store.upsertApproval(appr);
+        }
+      }
+    });
+
     const n = this.store.operationsForAttempt(attemptId).filter((o) => o.kind === 'run_validation').length + 1;
     const valOp = this.op(attemptId, 'run_validation', `validate:${attemptId}:${n}`, JSON.stringify(project.git!.validationCommands.map((c) => c.argv)));
-    const validation = await runValidation(project.git!.validationCommands, attempt.worktreePath, (line, level) =>
+    const preTree = await writeTreeSnapshot(worktree);
+    const validation = await runValidation(project.git!.validationCommands, worktree, (line, level) =>
       this.log(this.store.attempt(attemptId)!, line, level),
     );
+    const postTree = await writeTreeSnapshot(worktree);
+    const mutations = postTree === preTree ? [] : await diffTreePaths(worktree, preTree, postTree);
+
+    // final evidence must represent the actual final worktree (P0-1)
+    const evidence = await this.captureEvidence(worktree, attempt.baseCommit, project, worker?.name ?? attempt.workerId, attempt.evidence?.workerLogTail ?? []);
+    evidence.preValidationTree = preTree;
+    evidence.postValidationTree = postTree;
+    evidence.validationMutations = mutations;
+    this.applyIntegritySteps(validation, evidence, worktree, []);
     this.finishOp(valOp, validation.status === 'FAILED' ? 'failed' : 'succeeded');
+
+    // keep the delivery durable: checkpoint anything new (P0-2)
+    const ckOp = this.op(attemptId, 'checkpoint', `checkpoint:${attemptId}:reval:${n}`, JSON.stringify(['git', 'commit', '--no-verify']));
+    let checkpoint: string | null = null;
+    try {
+      checkpoint = (await commitCheckpoint(worktree, `Command Center checkpoint — attempt ${attemptId} (after re-validation ${n})`)) ?? attempt.checkpointCommit ?? null;
+      evidence.checkpointCommit = checkpoint;
+      this.finishOp(ckOp, 'succeeded', 0);
+    } catch (err) {
+      this.finishOp(ckOp, 'failed', null, (err as Error).message);
+      throw new LifecycleError(`Checkpoint after re-validation failed: ${(err as Error).message}`);
+    }
+
     if (attempt.state === 'blocked_reconciliation') {
-      this.settleForReview(attemptId, validation);
+      this.settleForReview(attemptId, validation, evidence, checkpoint);
     } else {
-      attempt.validation = validation;
-      this.store.updateAttempt(attempt);
-      this.event('verify.passed', `Re-validation finished: ${validation.status}`, attempt.taskId, validation.status === 'FAILED' ? 'warning' : 'success', { attemptId });
+      this.store.tx(() => {
+        const a = this.store.attempt(attemptId)!;
+        a.validation = validation;
+        a.evidence = evidence;
+        a.checkpointCommit = checkpoint;
+        a.evidenceHash = this.computeEvidenceHash(attemptId, evidence, validation, checkpoint);
+        this.store.updateAttempt(a);
+        this.issueCompletionApproval(this.store.task(a.taskId)!, a, validation);
+      });
+      this.event('verify.passed', `Re-validation finished: ${validation.status} — pending completion approval replaced with refreshed evidence`, attempt.taskId, validation.status === 'FAILED' ? 'warning' : 'success', { attemptId });
     }
     return this.store.attempt(attemptId)!;
   }
 
-  /** explicit, safe worktree removal for terminal attempts (branch is kept) */
-  async cleanupWorktree(attemptId: string): Promise<Attempt> {
+  /**
+   * Explicit worktree removal (P0-2). Removal is REFUSED unless the worktree
+   * content is provably preserved (a verified durable checkpoint commit, or
+   * nothing beyond the base commit) — or the owner explicitly confirms
+   * irreversible discard. The attempt branch is always kept.
+   */
+  async cleanupWorktree(attemptId: string, opts: { confirmDiscard?: boolean } = {}): Promise<Attempt> {
     const attempt = this.store.attempt(attemptId);
     if (!attempt) throw new NotFound('Attempt not found.');
-    if (['creating_worktree', 'running', 'validating'].includes(attempt.state)) {
+    if (['creating_worktree', 'running', 'validating', 'cancelling'].includes(attempt.state)) {
       throw new LifecycleError('Attempt is still active — cancel it first.');
     }
     if (!attempt.worktreePath || attempt.worktreeCleanedAt) return attempt;
     const project = this.store.project(attempt.projectId);
-    const op = this.op(attemptId, 'cleanup_worktree', `cleanup:${attemptId}`, JSON.stringify(['git', 'worktree', 'remove', attempt.worktreePath]));
+    const repo = project?.git?.canonicalRoot ?? null;
+
+    // verify losslessness BEFORE destroying anything
+    let lossless = false;
+    let lossDetail = 'worktree state could not be verified';
+    if (!fs.existsSync(attempt.worktreePath)) {
+      lossless = true; // nothing on disk to lose
+      lossDetail = 'worktree directory already gone';
+    } else if (repo) {
+      try {
+        const status = await statusPorcelain(attempt.worktreePath);
+        const head = await headCommit(attempt.worktreePath);
+        if (attempt.checkpointCommit) {
+          const durable = await commitExists(repo, attempt.checkpointCommit);
+          lossless = durable && status === '' && head === attempt.checkpointCommit;
+          lossDetail = !durable
+            ? `checkpoint ${attempt.checkpointCommit.slice(0, 10)} is missing from the repository`
+            : status !== ''
+              ? 'the worktree has uncommitted changes beyond the checkpoint'
+              : head !== attempt.checkpointCommit
+                ? `worktree HEAD ${head?.slice(0, 10) ?? 'unknown'} does not match the checkpoint`
+                : '';
+        } else {
+          lossless = status === '' && head === attempt.baseCommit;
+          lossDetail = status !== '' ? 'the worktree has uncommitted work and NO durable checkpoint' : `worktree HEAD moved to ${head?.slice(0, 10) ?? 'unknown'} without a recorded checkpoint`;
+        }
+      } catch (err) {
+        lossless = false;
+        lossDetail = `git verification failed: ${(err as Error).message}`;
+      }
+    }
+
+    if (!lossless && !opts.confirmDiscard) {
+      throw new LifecycleError(
+        `Refusing to remove the worktree: ${lossDetail}. Removing it now would PERMANENTLY DESTROY that work. ` +
+          'Re-validate to create a checkpoint, or explicitly confirm irreversible discard.',
+      );
+    }
+
+    const op = this.op(attemptId, 'cleanup_worktree', `cleanup:${attemptId}`, JSON.stringify(['git', 'worktree', 'remove', attempt.worktreePath, lossless ? '(lossless)' : '(owner-confirmed discard)']));
     try {
-      if (project?.git && fs.existsSync(attempt.worktreePath)) {
-        await worktreeRemove(project.git.canonicalRoot, attempt.worktreePath);
+      if (repo && fs.existsSync(attempt.worktreePath)) {
+        await worktreeRemove(repo, attempt.worktreePath);
       }
       attempt.worktreeCleanedAt = nowIso();
       attempt.worktreeHealth = 'missing';
       this.store.updateAttempt(attempt);
       this.finishOp(op, 'succeeded', 0);
-      this.event('attempt.cleanup', `Worktree removed for attempt ${attemptId} (branch ${attempt.branchName} kept)`, attempt.taskId);
+      this.event(
+        'attempt.cleanup',
+        lossless
+          ? `Worktree removed for attempt ${attemptId} — all work is preserved on branch ${attempt.branchName}${attempt.checkpointCommit ? ` at checkpoint ${attempt.checkpointCommit.slice(0, 10)}` : ' (no changes existed)'}`
+          : `Worktree removed for attempt ${attemptId} — owner explicitly confirmed IRREVERSIBLE DISCARD of un-checkpointed work (branch ${attempt.branchName} kept)`,
+        attempt.taskId,
+        lossless ? 'info' : 'warning',
+      );
     } catch (err) {
       this.finishOp(op, 'failed', null, (err as Error).message);
       throw new LifecycleError(`Worktree cleanup failed: ${(err as Error).message}`);
@@ -793,6 +1223,11 @@ export class AttemptService {
       } else if (attempt.state === 'validating') {
         attempt.state = 'blocked_reconciliation';
         attempt.failureReason = 'Validation was interrupted by a restart — re-run validation (the worker will not re-run).';
+      } else if (attempt.state === 'cancelling') {
+        attempt.state = 'cancelled';
+        attempt.exitReason = 'cancelled';
+        attempt.failureReason =
+          'Cancellation was in progress when the Command Center restarted. Child-process termination could not be re-verified after the restart; the worktree is preserved for inspection.';
       } else {
         attempt.state = 'failed';
         attempt.exitReason = 'unknown';
@@ -805,10 +1240,16 @@ export class AttemptService {
       this.finishOp(op, 'succeeded');
 
       if (task && !['completed', 'cancelled'].includes(task.status)) {
-        task.status = 'blocked';
-        task.blockReason = attempt.failureReason;
-        task.phase = 'Blocked (recovery)';
-        this.store.upsertTask(task);
+        if (attempt.exitReason === 'cancelled') {
+          task.status = 'cancelled';
+          task.phase = null;
+          this.store.upsertTask(task);
+        } else {
+          task.status = 'blocked';
+          task.blockReason = attempt.failureReason;
+          task.phase = 'Blocked (recovery)';
+          this.store.upsertTask(task);
+        }
         this.event('run.interrupted', `Attempt ${attempt.id} reconciled after restart → ${attempt.state} (worktree: ${health})`, task.id, 'warning', { attemptId: attempt.id });
       }
     }

@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite';
  *  - WAL mode gives crash-safe writes; each statement is durable.
  */
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -80,9 +80,9 @@ CREATE TABLE IF NOT EXISTS attempts (
   started_at     TEXT NOT NULL,
   json           TEXT NOT NULL
 );
--- hard guarantee: one active attempt per task
+-- hard guarantee: one active attempt per task ('cancelling' still holds it)
 CREATE UNIQUE INDEX IF NOT EXISTS attempts_one_active ON attempts(task_id)
-  WHERE state IN ('creating_worktree','running','validating');
+  WHERE state IN ('creating_worktree','running','validating','cancelling');
 CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
 
 CREATE TABLE IF NOT EXISTS operations (
@@ -114,6 +114,16 @@ CREATE INDEX IF NOT EXISTS leases_attempt ON leases(attempt_id);
 export class Db {
   readonly sqlite: DatabaseSync;
   private txDepth = 0;
+  /**
+   * Called after the OUTERMOST transaction ends: `true` after a successful
+   * COMMIT, `false` after a ROLLBACK. Used by the Store to buffer SSE
+   * broadcasts until the data they describe is actually durable (P0-6).
+   */
+  onTxEnd: ((committed: boolean) => void) | null = null;
+
+  get inTransaction(): boolean {
+    return this.txDepth > 0;
+  }
 
   constructor(readonly file: string) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -144,7 +154,15 @@ export class Db {
       );
     }
     if (current < SCHEMA_VERSION) {
-      // future migrations run here, one version at a time
+      if (current < 2) {
+        // v2: the one-active-attempt index must also cover 'cancelling'
+        // (CREATE INDEX IF NOT EXISTS never updates an existing definition)
+        this.sqlite.exec('DROP INDEX IF EXISTS attempts_one_active');
+        this.sqlite.exec(
+          "CREATE UNIQUE INDEX attempts_one_active ON attempts(task_id) " +
+            "WHERE state IN ('creating_worktree','running','validating','cancelling')",
+        );
+      }
       this.setMeta('schema_version', String(SCHEMA_VERSION));
     }
   }
@@ -177,9 +195,11 @@ export class Db {
     }
     this.sqlite.exec('BEGIN IMMEDIATE');
     this.txDepth = 1;
+    let committed = false;
     try {
       const result = fn();
       this.sqlite.exec('COMMIT');
+      committed = true;
       return result;
     } catch (err) {
       try {
@@ -190,6 +210,7 @@ export class Db {
       throw err;
     } finally {
       this.txDepth = 0;
+      this.onTxEnd?.(committed);
     }
   }
 

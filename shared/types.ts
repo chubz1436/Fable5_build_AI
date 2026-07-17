@@ -249,6 +249,8 @@ export interface Approval {
   baseCommit: string | null;
   /** canonical hash of the exact authorized action payload */
   payloadHash: string | null;
+  /** full immutable spec the hash covers (start approvals, P0-4) */
+  executionSpec?: ExecutionSpec | null;
   expiresAt: string | null;
   singleUse: boolean;
   consumedAt: string | null;
@@ -347,6 +349,7 @@ export type AttemptState =
   | 'creating_worktree'
   | 'running'
   | 'validating'
+  | 'cancelling'               // owner cancelled; termination not yet proven
   | 'ready_for_review'
   | 'accepted'
   | 'rejected'
@@ -360,6 +363,9 @@ export const ACTIVE_ATTEMPT_STATES: AttemptState[] = [
   'creating_worktree',
   'running',
   'validating',
+  // leases stay held while cancelling: they are only released once every
+  // child process is proven terminated (P0-3)
+  'cancelling',
 ];
 
 export type ExitReason =
@@ -385,8 +391,40 @@ export interface ValidationStepResult {
   endedAt: string | null;
   timeoutMs: number;
   exitCode: number | null;
-  status: 'PASSED' | 'FAILED' | 'TIMEOUT' | 'ERROR' | 'SKIPPED';
+  status: 'PASSED' | 'FAILED' | 'TIMEOUT' | 'ERROR' | 'SKIPPED' | 'CANCELLED';
   outputTail: string[];
+}
+
+// ---------------------------------------------------------------------------
+// ExecutionSpec: the complete, canonical description of what a start approval
+// authorizes (P0-4). The approval hash covers EVERY consequential field; any
+// material change after the grant invalidates it.
+// ---------------------------------------------------------------------------
+
+export interface ExecutionSpec {
+  taskId: string;
+  goal: string;
+  scope: string[];
+  acceptanceCriteria: string[];
+  risk: RiskLevel;
+  workerId: string;
+  adapter: string;
+  model: string | null;
+  /** version string reported by the adapter executable at grant time */
+  adapterVersion: string | null;
+  projectId: string;
+  /** canonical repository root (case-normalized on Windows for hashing) */
+  repoRoot: string;
+  baseBranch: string;
+  baseCommit: string;
+  protectedPaths: string[];
+  validationCommands: Array<{ name: string; argv: string[]; required: boolean; timeoutMs: number }>;
+  /** worker sandbox mode, e.g. 'workspace-write' (codex) or 'none' (test runner) */
+  sandbox: string;
+  networkAccess: boolean;
+  dependencyInstallAllowed: boolean;
+  workerTimeoutMs: number;
+  validationDefaultTimeoutMs: number;
 }
 
 export interface AttemptValidation {
@@ -399,12 +437,22 @@ export interface AttemptValidation {
 export interface AttemptEvidence {
   changedFiles: FileChange[];
   diffStat: string;
-  /** unified diff, size-capped */
+  /** unified diff, size-capped — captured AFTER validation, so it represents the actual final worktree */
   diff: string;
   diffTruncated: boolean;
   gitStatus: string;
   protectedViolations: string[];
   workerLogTail: string[];
+  /** git tree hash of the worktree content before validation ran (P0-1) */
+  preValidationTree?: string | null;
+  /** git tree hash after validation ran; differs when validation mutated files */
+  postValidationTree?: string | null;
+  /** files modified by VALIDATION (not the worker); non-empty blocks VERIFIED */
+  validationMutations?: string[];
+  /** symlinks/junctions inside the worktree that resolve outside it (P1) */
+  symlinkEscapes?: string[];
+  /** app-generated checkpoint commit that durably contains this delivery (P0-2) */
+  checkpointCommit?: string | null;
 }
 
 export interface Attempt {
@@ -433,6 +481,12 @@ export interface Attempt {
   delivery: 'accepted' | 'rejected' | 'correction_requested' | null;
   worktreeCleanedAt: string | null;
   worktreeHealth: 'ok' | 'missing' | 'branch_mismatch' | 'unknown' | null;
+  /** exact spec this attempt was authorized against (P0-4) */
+  executionSpec?: ExecutionSpec | null;
+  /** app-generated commit on the attempt branch containing the validated work (P0-2) */
+  checkpointCommit?: string | null;
+  /** hash binding the completion approval to this exact evidence (P1) */
+  evidenceHash?: string | null;
 }
 
 export type OperationKind =
@@ -442,6 +496,8 @@ export type OperationKind =
   | 'capture_diff'
   | 'run_validation'
   | 'consume_approval'
+  | 'checkpoint'
+  | 'integrity_check'
   | 'cleanup_worktree'
   | 'reconcile';
 

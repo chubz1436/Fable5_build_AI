@@ -97,7 +97,9 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     antigravityCommand: process.env.ANTIGRAVITY_CLI ?? 'agy',
     antigravityTimeoutMs: Number(process.env.ANTIGRAVITY_TIMEOUT_MS ?? 600_000),
     antigravityModel: process.env.ANTIGRAVITY_MODEL ?? '',
-    antigravitySkipPermissions: process.env.ANTIGRAVITY_SKIP_PERMISSIONS !== '0',
+    // dangerous permission bypass is OPT-IN only (P0-5); the legacy
+    // Antigravity adapter is quarantined and unreachable regardless
+    antigravitySkipPermissions: process.env.ANTIGRAVITY_SKIP_PERMISSIONS === '1',
 
     attemptRunner: process.env.ATTEMPT_RUNNER === 'test' ? 'test' : 'codex',
     approvalTtlMs: Number(process.env.APPROVAL_TTL_MS ?? 30 * 60_000),

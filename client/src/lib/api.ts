@@ -91,5 +91,6 @@ export const api = {
   // -- attempts -----------------------------------------------------------------
   attemptDetail: (id: string) => req<{ attempt: Attempt; operations: OperationRecord[] }>(`/attempts/${id}`),
   revalidate: (id: string) => req<Attempt>(`/attempts/${id}/revalidate`, { method: 'POST', body: '{}' }),
-  cleanupWorktree: (id: string) => req<Attempt>(`/attempts/${id}/cleanup`, { method: 'POST', body: '{}' }),
+  cleanupWorktree: (id: string, confirmDiscard = false) =>
+    req<Attempt>(`/attempts/${id}/cleanup`, { method: 'POST', body: JSON.stringify({ confirmDiscard }) }),
 };

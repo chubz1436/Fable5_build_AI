@@ -7,6 +7,7 @@ const STATE_TONE: Record<string, string> = {
   creating_worktree: 'b-accent',
   running: 'b-accent',
   validating: 'b-accent',
+  cancelling: 'b-warning',
   ready_for_review: 'b-success',
   accepted: 'b-success',
   rejected: 'b-warning',
@@ -39,7 +40,10 @@ export function AttemptPanel({ attempt, operations }: { attempt: Attempt; operat
       setBusy(false);
     }
   };
-  const terminal = !['creating_worktree', 'running', 'validating'].includes(attempt.state);
+  const terminal = !['creating_worktree', 'running', 'validating', 'cancelling'].includes(attempt.state);
+  // truthful cleanup semantics (P0-2): with a checkpoint the work survives on
+  // the branch; without one, removal permanently destroys uncommitted work.
+  const hasCheckpoint = !!attempt.checkpointCommit;
 
   return (
     <div className="card">
@@ -58,7 +62,13 @@ export function AttemptPanel({ attempt, operations }: { attempt: Attempt; operat
         <dt>Branch</dt>
         <dd className="mono small">{attempt.branchName ?? '—'} (base {attempt.baseCommit.slice(0, 10)})</dd>
         <dt>Worktree</dt>
-        <dd className="mono small">{attempt.worktreeCleanedAt ? 'cleaned up' : attempt.worktreePath ?? '—'}</dd>
+        <dd className="mono small">{attempt.worktreeCleanedAt ? 'removed' : attempt.worktreePath ?? '—'}</dd>
+        {attempt.checkpointCommit && (
+          <>
+            <dt>Checkpoint</dt>
+            <dd className="mono small">{attempt.checkpointCommit.slice(0, 12)} (durable on {attempt.branchName})</dd>
+          </>
+        )}
         {attempt.executablePath && (
           <>
             <dt>Executable</dt>
@@ -103,9 +113,26 @@ export function AttemptPanel({ attempt, operations }: { attempt: Attempt; operat
             ↻ Re-run validation only
           </button>
         )}
-        {terminal && attempt.worktreePath && !attempt.worktreeCleanedAt && (
-          <button className="btn sm danger" disabled={busy} onClick={act(() => api.cleanupWorktree(attempt.id))}>
-            🧹 Remove worktree (keeps branch)
+        {terminal && attempt.worktreePath && !attempt.worktreeCleanedAt && hasCheckpoint && (
+          <button className="btn sm" disabled={busy} onClick={act(() => api.cleanupWorktree(attempt.id))}>
+            🧹 Remove worktree — work is preserved at checkpoint {attempt.checkpointCommit!.slice(0, 8)} on {attempt.branchName}
+          </button>
+        )}
+        {terminal && attempt.worktreePath && !attempt.worktreeCleanedAt && !hasCheckpoint && (
+          <button
+            className="btn sm danger"
+            disabled={busy}
+            onClick={act(async () => {
+              if (
+                !window.confirm(
+                  'This attempt has NO durable checkpoint. Removing the worktree will PERMANENTLY DESTROY any uncommitted work in it (only the empty branch is kept). Discard irreversibly?',
+                )
+              )
+                return;
+              await api.cleanupWorktree(attempt.id, true);
+            })}
+          >
+            🗑 Discard worktree — uncommitted work will be LOST
           </button>
         )}
       </div>

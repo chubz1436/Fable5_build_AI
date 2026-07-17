@@ -37,10 +37,26 @@ export class ConflictError extends Error {
 export class Store {
   readonly emitter = new EventEmitter();
   private eventInserts = 0;
+  /** SSE messages produced inside an open transaction (P0-6) */
+  private txBuffer: StreamMessage[] = [];
 
-  constructor(readonly db: Db) {}
+  constructor(readonly db: Db) {
+    // Broadcasts describing uncommitted writes are held back until the
+    // outermost COMMIT succeeds; a ROLLBACK discards them so subscribers
+    // never observe phantom state (P0-6).
+    db.onTxEnd = (committed) => {
+      const buffered = this.txBuffer;
+      this.txBuffer = [];
+      if (!committed) return;
+      for (const message of buffered) this.emitter.emit('message', message);
+    };
+  }
 
   private broadcast(message: StreamMessage): void {
+    if (this.db.inTransaction) {
+      this.txBuffer.push(message);
+      return;
+    }
     this.emitter.emit('message', message);
   }
 

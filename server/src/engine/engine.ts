@@ -11,19 +11,22 @@ import { buildHandoff } from '../domain/handoff';
 import { assertTransition, LifecycleError, TERMINAL_STATUSES } from '../domain/lifecycle';
 import { recommendWorker } from '../domain/recommend';
 import { nowIso, uid } from '../domain/util';
-import path from 'node:path';
 import type { Store } from '../store/store';
-import { AntigravityAdapter } from './adapters/antigravity';
-import { ClaudeCodeAdapter } from './adapters/claude-code';
 import { detectCli } from './adapters/cli-common';
-import { CodexAdapter } from './adapters/codex';
 import { SimulatedAdapter } from './adapters/simulated';
 import type { RunContext, RunResult, WorkerAdapter } from './adapters/types';
 
 /**
- * The orchestrator. Owns every task/worker state change; adapters only
- * report what is happening through their RunContext. Routes call into the
- * engine for anything with side effects.
+ * The orchestrator for SAMPLE (non-git) projects. Owns every task/worker
+ * state change; adapters only report what is happening through their
+ * RunContext. Routes call into the engine for anything with side effects.
+ *
+ * QUARANTINE (P0-5): this legacy Engine path only ever executes the
+ * SimulatedAdapter. The legacy real CLI adapters (claude-code / codex /
+ * antigravity under ./adapters) are NOT instantiated here — they lack leases,
+ * Attempt/Operation records, exact approvals and independent verification.
+ * Every REAL execution must go through AttemptService (repository-backed
+ * tasks); until an adapter is migrated to that pipeline it cannot run.
  */
 export class Engine {
   private adapters = new Map<string, WorkerAdapter>();
@@ -36,35 +39,7 @@ export class Engine {
     private readonly store: Store,
     private readonly config: AppConfig,
   ) {
-    const workspaceRoot = path.join(config.dataDir, 'workspaces');
     this.adapters.set('simulated', new SimulatedAdapter());
-    this.adapters.set(
-      'claude-code',
-      new ClaudeCodeAdapter({
-        command: config.claudeCommand,
-        timeoutMs: config.claudeTimeoutMs,
-        workspaceRoot,
-      }),
-    );
-    this.adapters.set(
-      'codex',
-      new CodexAdapter({
-        command: config.codexCommand,
-        timeoutMs: config.codexTimeoutMs,
-        workspaceRoot,
-        model: config.codexModel,
-      }),
-    );
-    this.adapters.set(
-      'antigravity',
-      new AntigravityAdapter({
-        command: config.antigravityCommand,
-        timeoutMs: config.antigravityTimeoutMs,
-        workspaceRoot,
-        model: config.antigravityModel,
-        skipPermissions: config.antigravitySkipPermissions,
-      }),
-    );
   }
 
   // -- helpers ----------------------------------------------------------------
@@ -81,10 +56,11 @@ export class Engine {
     return worker;
   }
 
-  private adapterFor(worker: WorkerProfile): WorkerAdapter {
-    const adapter = this.adapters.get(worker.adapter);
-    if (!adapter) throw new Error(`No adapter registered for kind "${worker.adapter}"`);
-    return adapter;
+  private adapterFor(_worker: WorkerProfile): WorkerAdapter {
+    // P0-5: sample tasks ALWAYS run on the SimulatedAdapter, even when a
+    // worker was upgraded to a real CLI adapter for repository-backed
+    // attempts. No real CLI ever executes through this legacy path.
+    return this.adapters.get('simulated')!;
   }
 
   private freeWorker(workerId: string | null): void {
@@ -718,11 +694,15 @@ export class NotFoundError extends Error {
 }
 
 /**
- * Boot-time honesty pass: probe for each supported local CLI and upgrade the
- * matching worker to its real adapter when the CLI is actually available —
- * or revert it to simulated when it is not. Runs only from the runtime
- * entrypoint (never in tests). Antigravity has no headless CLI, so it is
- * intentionally absent here and stays simulated.
+ * Boot-time honesty pass: probe for each supported local CLI and mark the
+ * matching worker's adapter/readiness accordingly — or revert it to simulated
+ * when the CLI is absent. Runs only from the runtime entrypoint (never in
+ * tests).
+ *
+ * IMPORTANT (P0-5): the adapter field ONLY routes repository-backed tasks
+ * through the hardened AttemptService. Sample tasks always execute on the
+ * SimulatedAdapter regardless of this detection; the legacy real adapters are
+ * quarantined and never instantiated by the Engine.
  */
 export async function enableRealAdapters(store: Store, config: AppConfig): Promise<void> {
   const probes: Array<{
@@ -764,7 +744,7 @@ export async function enableRealAdapters(store: Store, config: AppConfig): Promi
           type: 'system.adapter',
           level: 'success',
           workerId: worker.id,
-          message: `${probe.label} detected (${version}) — worker “${worker.name}” now uses the REAL adapter`,
+          message: `${probe.label} detected (${version}) — worker “${worker.name}” can run REPOSITORY-BACKED attempts for real (sample tasks stay simulated)`,
         });
       }
     } else if (worker.adapter === probe.adapter) {
