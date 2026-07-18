@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { Approval, Project, Task } from '../../shared/types';
-import { allowlistedChildEnv, CODEX_ENV_EXTRA, minimalValidationEnv } from '../src/attempts/env';
+import { allowlistedChildEnv, codexEnvExtra, minimalValidationEnv } from '../src/attempts/env';
 import { makeTempGitRepo, testContext, waitFor } from './helpers';
 
 async function registerRepo(agent: ReturnType<typeof testContext>['agent'], repo: string, extra: Record<string, unknown> = {}): Promise<Project> {
@@ -26,12 +26,12 @@ describe('worker environment allowlist', () => {
       MY_COMPANY_DB_PASSWORD: 'hunter2',
       RANDOM_SECRET_XYZ: 'should-not-leak',
     };
-    const env = allowlistedChildEnv(CODEX_ENV_EXTRA, base);
-    // base benign + Codex login vars preserved
+    // DEFAULT mode: on-disk codex login only — no API key is forwarded
+    const env = allowlistedChildEnv(codexEnvExtra('login_file'), base);
     expect(env.PATH).toBe('C:\\bin');
     expect(env.SYSTEMROOT).toBe('C:\\Windows');
-    expect(env.CODEX_HOME).toBe('C:\\Users\\me\\.codex');
-    expect(env.OPENAI_API_KEY).toBe('sk-real-login-key'); // normal Codex login preserved
+    expect(env.CODEX_HOME).toBe('C:\\Users\\me\\.codex'); // login file location
+    expect(env.OPENAI_API_KEY).toBeUndefined();
     // Command Center + arbitrary secrets excluded by construction
     for (const k of ['AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'MY_COMPANY_DB_PASSWORD', 'RANDOM_SECRET_XYZ']) {
       expect(env[k], k).toBeUndefined();
