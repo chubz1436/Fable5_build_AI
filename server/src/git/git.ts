@@ -1,11 +1,21 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 /**
  * Safe git plumbing. Every call is `execFile('git', [...args])` — argument
  * arrays only, no shell, no string composition. Callers pass canonical
  * repository paths that were validated at registration time.
+ *
+ * Hardening (applied to EVERY invocation):
+ *  - `core.hooksPath` is pointed at a controlled EMPTY directory, so no
+ *    repository hook (pre-commit, post-checkout, …) can ever execute while the
+ *    Command Center drives git — a hostile repo cannot run code through us.
+ *  - `diff.external` is cleared, so no external diff driver runs.
+ *  - `core.fsmonitor` is disabled (no long-running fsmonitor child).
+ *  - the environment cannot prompt for credentials or reach the network.
+ * These `-c` overrides win over repo/global/system config.
  */
 
 export interface GitResult {
@@ -21,12 +31,54 @@ export class GitError extends Error {
   }
 }
 
+let cachedHooksDir: string | null = null;
+
+/** a controlled, empty hooks directory reused for every git invocation */
+export function emptyHooksPath(): string {
+  if (cachedHooksDir && fs.existsSync(cachedHooksDir)) return cachedHooksDir;
+  const dir = path.join(os.tmpdir(), 'chubz-cc-empty-hooks');
+  fs.mkdirSync(dir, { recursive: true });
+  // guard: if anything ever dropped a hook here, refuse to trust it silently
+  for (const entry of fs.readdirSync(dir)) {
+    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+  }
+  cachedHooksDir = dir;
+  return dir;
+}
+
+/** config overrides forced onto every git call (hooks/ext-diff/fsmonitor off) */
+function hardeningArgs(): string[] {
+  return [
+    '-c', `core.hooksPath=${emptyHooksPath()}`,
+    '-c', 'diff.external=',
+    '-c', 'core.fsmonitor=false',
+  ];
+}
+
+/** subcommands that accept diff-content flags: also block textconv/ext-diff */
+const DIFF_SUBCOMMANDS = new Set(['diff', 'diff-tree', 'diff-index', 'log', 'show']);
+
+function noExtDiffArgs(args: string[]): string[] {
+  return DIFF_SUBCOMMANDS.has(args[0] ?? '') ? ['--no-ext-diff', '--no-textconv'] : [];
+}
+
+const HARDENED_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_OPTIONAL_LOCKS: '0',
+  // never let git invoke an editor/pager or an askpass helper
+  GIT_PAGER: 'cat',
+  GIT_ASKPASS: '',
+  GIT_SSH_COMMAND: 'false',
+};
+
 export function runGit(args: string[], cwd?: string, timeoutMs = 30_000): Promise<GitResult> {
+  const full = [...hardeningArgs(), args[0]!, ...noExtDiffArgs(args), ...args.slice(1)];
   return new Promise((resolve) => {
     execFile(
       'git',
-      args,
-      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
+      full,
+      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: HARDENED_ENV },
       (err, stdout, stderr) => {
         const raw: unknown = err ? (err as NodeJS.ErrnoException & { code?: unknown }).code : 0;
         resolve({ code: typeof raw === 'number' ? raw : err ? 1 : 0, stdout: stdout ?? '', stderr: stderr ?? '' });

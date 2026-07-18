@@ -4,6 +4,7 @@ import type {
   ValidationStepResult,
 } from '../../../shared/types';
 import { nowIso, uid } from '../domain/util';
+import { minimalValidationEnv } from './env';
 import { killProcessTree, redactSecrets, resolveExecutable, spawnSafe } from './runners';
 
 /**
@@ -35,44 +36,27 @@ import { killProcessTree, redactSecrets, resolveExecutable, spawnSafe } from './
  * secret-like variable — is dropped by construction (allowlist, not
  * blocklist). Comparison is case-insensitive (Windows env semantics).
  */
-const ENV_ALLOWLIST = new Set(
-  [
-    // process discovery / execution
-    'PATH', 'PATHEXT', 'COMSPEC', 'SHELL',
-    // Windows system locations many tools require
-    'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'OS',
-    'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'PROGRAMDATA',
-    'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)',
-    // per-user locations (npm/node caches and tool state live here)
-    'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
-    'APPDATA', 'LOCALAPPDATA', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
-    // temp dirs
-    'TEMP', 'TMP', 'TMPDIR',
-    // benign machine/user identity + locale
-    'USERNAME', 'USER', 'USERDOMAIN', 'COMPUTERNAME', 'HOSTNAME', 'LOGNAME',
-    'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM',
-    // hardware hints used by test runners for parallelism
-    'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER',
-  ].map((k) => k.toUpperCase()),
-);
+// env allowlisting lives in ./env (shared with the worker runners; re-exported
+// here so existing importers keep working)
+export { allowlistedChildEnv, minimalValidationEnv } from './env';
 
-/** minimal allowlisted environment for validation subprocesses (P0-1) */
-export function minimalValidationEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of Object.keys(base)) {
-    if (ENV_ALLOWLIST.has(key.toUpperCase())) env[key] = base[key];
-  }
-  // deliberate signal to validation tooling: non-interactive, CI-like
-  env.CI = '1';
-  return env;
+export interface RunValidationOptions {
+  signal?: AbortSignal;
+  /**
+   * Run before EACH command. Returning a non-null reason fails the step closed
+   * (required → FAILED) and aborts the rest — used to re-scan for symlink /
+   * junction escapes before every command (fail-closed containment).
+   */
+  beforeCommand?: () => string | null;
 }
 
 export async function runValidation(
   commands: ValidationCommand[],
   worktree: string,
   onLog: (line: string, level?: 'info' | 'warning' | 'error') => void,
-  signal?: AbortSignal,
+  options: RunValidationOptions = {},
 ): Promise<AttemptValidation> {
+  const { signal, beforeCommand } = options;
   if (commands.length === 0) {
     onLog('[verify] no validation commands configured — result is UNVERIFIED', 'warning');
     return { status: 'UNVERIFIED', steps: [], completedAt: nowIso() };
@@ -84,6 +68,7 @@ export async function runValidation(
   let requiredFailed = false;
   let optionalFailed = false;
   let cancelled = signal?.aborted ?? false;
+  let guardTripped = false;
 
   for (const cmd of commands) {
     const step: ValidationStepResult = {
@@ -108,6 +93,19 @@ export async function runValidation(
       step.outputTail = ['cancelled before start'];
       steps.push(step);
       if (cmd.required) requiredFailed = true;
+      continue;
+    }
+
+    // fail-closed containment re-scan before this command
+    const guardReason = guardTripped ? 'containment scan failed on an earlier command' : beforeCommand?.();
+    if (guardReason) {
+      guardTripped = true;
+      step.status = 'FAILED';
+      step.endedAt = nowIso();
+      step.outputTail = [`blocked before run: ${guardReason}`];
+      onLog(`[verify] ${cmd.name}: BLOCKED — ${guardReason}`, 'error');
+      steps.push(step);
+      requiredFailed = true; // any containment failure blocks a verified delivery
       continue;
     }
 

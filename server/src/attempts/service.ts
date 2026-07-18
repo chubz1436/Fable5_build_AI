@@ -33,7 +33,7 @@ import {
   writeTreeSnapshot,
 } from '../git/git';
 import { ConflictError, type Store } from '../store/store';
-import { findSymlinkEscapes, readGitLinkFile, verifyWorktreeIntegrity } from './integrity';
+import { captureGitBaseline, findSymlinkEscapes, readGitLinkFile, verifyWorktreeIntegrity, type GitBaseline } from './integrity';
 import { CodexRunner, TestRunner, type RunnerHandle, type WorkerRunner } from './runners';
 import { runValidation } from './validator';
 
@@ -79,11 +79,26 @@ export class AttemptService {
     return project;
   }
 
+  /** adapters AttemptService can actually drive for repository attempts */
+  static readonly REPO_ADAPTERS: ReadonlyArray<WorkerProfile['adapter']> = ['codex'];
+
+  /**
+   * Whether a worker may be selected for a repository-backed attempt. In the
+   * deterministic test-runner mode any worker is drivable (no real CLI runs);
+   * in normal mode only adapters AttemptService supports are eligible.
+   */
+  supportsRepositoryAttempts(worker: WorkerProfile): boolean {
+    if (this.config.attemptRunner === 'test') return true;
+    return AttemptService.REPO_ADAPTERS.includes(worker.adapter);
+  }
+
   private runnerFor(worker: WorkerProfile): WorkerRunner {
     const kind = this.config.attemptRunner === 'test' ? 'test' : worker.adapter === 'codex' ? 'codex' : null;
     if (!kind) {
       throw new LifecycleError(
-        `${worker.name} cannot execute repository tasks yet — this release is Codex-first (or the deterministic test runner).`,
+        `${worker.name} (${worker.adapter}) is not available for repository attempts — ` +
+          `AttemptService can drive only: ${AttemptService.REPO_ADAPTERS.join(', ')}. ` +
+          'Select a supported worker (Codex) or migrate this adapter onto the attempt pipeline.',
       );
     }
     return this.runners.get(kind)!;
@@ -372,8 +387,11 @@ export class AttemptService {
       this.store.upsertApproval(fresh);
 
       this.store.insertAttempt(attempt);
-      // idempotency: a second click can never dispatch twice
-      this.op(attemptId, 'consume_approval', `dispatch:${approval.id}`, JSON.stringify({ approvalId: approval.id }));
+      // idempotency: a second click can never dispatch twice. The op both
+      // starts AND completes inside this transaction so a consumed approval
+      // never leaves a dangling 'running' operation behind (op-status fix).
+      const consumeOp = this.op(attemptId, 'consume_approval', `dispatch:${approval.id}`, JSON.stringify({ approvalId: approval.id }));
+      this.finishOp(consumeOp, 'succeeded', 0);
       this.store.acquireLeases(
         attemptId,
         [
@@ -527,6 +545,12 @@ export class AttemptService {
     return this.store.attempt(attemptId)?.state === 'cancelling';
   }
 
+  /** fail-closed containment re-scan: reason string when an escape is found */
+  private containmentGuard(worktreePath: string): string | null {
+    const escapes = findSymlinkEscapes(worktreePath);
+    return escapes.length ? `symlink/junction escape: ${escapes.slice(0, 8).join(', ')}` : null;
+  }
+
   private async pipeline(attemptId: string): Promise<void> {
     let attempt = this.store.attempt(attemptId)!;
     const task = this.mustTask(attempt.taskId);
@@ -558,13 +582,29 @@ export class AttemptService {
       if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
       return this.failAttempt(attemptId, 'failure', `Worktree creation failed: ${(err as Error).message}`);
     }
-    const gitLinkAtCreation = readGitLinkFile(worktreePath);
+    readGitLinkFile(worktreePath); // touch early so a broken link fails here
     attempt = this.store.attempt(attemptId)!;
     attempt.worktreePath = worktreePath;
     attempt.branchName = branch;
     attempt.worktreeHealth = 'ok';
     this.store.updateAttempt(attempt);
     this.log(attempt, `Isolated worktree ready: ${worktreePath} (branch ${branch} @ ${attempt.baseCommit.slice(0, 8)})`);
+
+    // capture the pre-execution git baseline (HEAD, branch, gitlink, refs,
+    // tags, local config, registration) — the yardstick every later integrity
+    // check compares against (git-integrity hardening)
+    let baseline: GitBaseline;
+    try {
+      baseline = await captureGitBaseline({ repo, worktreePath, attemptBranch: branch });
+    } catch (err) {
+      return this.failAttempt(attemptId, 'failure', `Could not capture git baseline: ${(err as Error).message}`);
+    }
+
+    // fail-closed containment scan BEFORE the worker is ever launched
+    const preLaunchEscapes = findSymlinkEscapes(worktreePath);
+    if (preLaunchEscapes.length > 0) {
+      return this.failAttempt(attemptId, 'failure', `Refusing to launch the worker — symlink/junction escape detected in the fresh worktree: ${preLaunchEscapes.slice(0, 8).join(', ')}`);
+    }
 
     // cancellation checkpoint: cancelled during creating_worktree must NEVER
     // proceed to worker launch (P0-3)
@@ -642,12 +682,19 @@ export class AttemptService {
       return this.failAttempt(attemptId, outcome.exitReason, outcome.error ?? 'Worker failed.', outcome.logTail);
     }
 
-    // 3) post-worker git integrity check (P1)
+    // 3) post-worker git integrity check (P1 + git-integrity hardening):
+    // the worker must not have created a commit, switched branches, or touched
+    // refs/tags/config; HEAD must still be the approved base commit.
     const intOp1 = this.op(attemptId, 'integrity_check', `integrity:${attemptId}:post_worker`, JSON.stringify({ phase: 'post_worker' }));
-    const issues1 = await verifyWorktreeIntegrity({ repo, worktreePath, expectedBranch: branch, baseCommit: attempt.baseCommit, expectedGitLink: gitLinkAtCreation });
+    const issues1 = await verifyWorktreeIntegrity({ repo, worktreePath, expectedBranch: branch, baseCommit: attempt.baseCommit, baseline, requireHeadAtBase: true });
     this.finishOp(intOp1, issues1.length ? 'failed' : 'succeeded', null, issues1.length ? issues1.map((i) => `${i.check}: ${i.detail}`).join('; ') : null);
     if (issues1.length) {
       return this.failAttempt(attemptId, 'failure', `Worktree integrity violated after worker run: ${issues1.map((i) => `${i.check} (${i.detail})`).join('; ')}`, outcome.logTail);
+    }
+    // fail-closed containment scan after the worker ran
+    const postWorkerEscapes = findSymlinkEscapes(worktreePath);
+    if (postWorkerEscapes.length > 0) {
+      return this.failAttempt(attemptId, 'failure', `Symlink/junction escape detected after the worker ran: ${postWorkerEscapes.slice(0, 8).join(', ')}`, outcome.logTail);
     }
     if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
 
@@ -688,7 +735,7 @@ export class AttemptService {
       project.git!.validationCommands,
       worktreePath,
       (line, level) => this.log(this.store.attempt(attemptId)!, line, level),
-      signal,
+      { signal, beforeCommand: () => this.containmentGuard(worktreePath) },
     );
     if (this.cancelRequested(attemptId)) {
       this.finishOp(valOp, 'failed', null, 'Cancelled by owner.');
@@ -714,17 +761,31 @@ export class AttemptService {
       return this.failAttempt(attemptId, 'failure', `Post-validation snapshot failed: ${(err as Error).message}`);
     }
 
-    // 7) post-validation git integrity (P1)
+    // 7) post-validation git integrity (P1) — HEAD must still be at base
+    // (validation must not have committed), refs/tags/config unchanged.
     const intOp2 = this.op(attemptId, 'integrity_check', `integrity:${attemptId}:post_validation`, JSON.stringify({ phase: 'post_validation' }));
-    const issues2 = await verifyWorktreeIntegrity({ repo, worktreePath, expectedBranch: branch, baseCommit: attempt.baseCommit, expectedGitLink: gitLinkAtCreation });
+    const issues2 = await verifyWorktreeIntegrity({ repo, worktreePath, expectedBranch: branch, baseCommit: attempt.baseCommit, baseline, requireHeadAtBase: true });
     this.finishOp(intOp2, issues2.length ? 'failed' : 'succeeded', null, issues2.length ? issues2.map((i) => `${i.check}: ${i.detail}`).join('; ') : null);
+    // fail-closed containment scan after validation ran
+    const postValEscapes = findSymlinkEscapes(worktreePath);
+    if (postValEscapes.length > 0) evidence.symlinkEscapes = [...(evidence.symlinkEscapes ?? []), ...postValEscapes];
 
     this.applyIntegritySteps(validation, evidence, worktreePath, issues2.map((i) => `${i.check}: ${i.detail}`));
     this.finishOp(valOp, validation.status === 'FAILED' ? 'failed' : 'succeeded', null, validation.status === 'FAILED' ? 'required validation failed' : null);
     if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
 
     // 8) durable checkpoint commit on the attempt branch (P0-2): the delivery
-    // must be lossless BEFORE it becomes reviewable
+    // must be lossless BEFORE it becomes reviewable. Require HEAD == approved
+    // base commit right before checkpointing (git-integrity hardening) and a
+    // clean containment scan, so we never checkpoint tampered git state.
+    const preCkHead = await headCommit(worktreePath);
+    if (preCkHead !== attempt.baseCommit) {
+      return this.failAttempt(attemptId, 'failure', `Refusing to checkpoint — worktree HEAD ${preCkHead?.slice(0, 10) ?? 'unknown'} is not the approved base commit ${attempt.baseCommit.slice(0, 10)} (a commit was created during the attempt).`, outcome.logTail);
+    }
+    const preCkEscapes = findSymlinkEscapes(worktreePath);
+    if (preCkEscapes.length > 0) {
+      return this.failAttempt(attemptId, 'failure', `Refusing to checkpoint — symlink/junction escape detected: ${preCkEscapes.slice(0, 8).join(', ')}`, outcome.logTail);
+    }
     let checkpoint: string | null = null;
     const ckOp = this.op(attemptId, 'checkpoint', `checkpoint:${attemptId}:1`, JSON.stringify(['git', 'commit', '--no-verify', '-m', `checkpoint attempt ${attemptId}`]));
     try {
@@ -1072,11 +1133,20 @@ export class AttemptService {
       }
     });
 
+    // fail-closed containment scan before re-validating
+    const revalEscapes = findSymlinkEscapes(worktree);
+    if (revalEscapes.length > 0) {
+      throw new LifecycleError(`Refusing to re-validate — symlink/junction escape detected: ${revalEscapes.slice(0, 8).join(', ')}`);
+    }
+
     const n = this.store.operationsForAttempt(attemptId).filter((o) => o.kind === 'run_validation').length + 1;
     const valOp = this.op(attemptId, 'run_validation', `validate:${attemptId}:${n}`, JSON.stringify(project.git!.validationCommands.map((c) => c.argv)));
     const preTree = await writeTreeSnapshot(worktree);
-    const validation = await runValidation(project.git!.validationCommands, worktree, (line, level) =>
-      this.log(this.store.attempt(attemptId)!, line, level),
+    const validation = await runValidation(
+      project.git!.validationCommands,
+      worktree,
+      (line, level) => this.log(this.store.attempt(attemptId)!, line, level),
+      { beforeCommand: () => this.containmentGuard(worktree) },
     );
     const postTree = await writeTreeSnapshot(worktree);
     const mutations = postTree === preTree ? [] : await diffTreePaths(worktree, preTree, postTree);
@@ -1086,6 +1156,8 @@ export class AttemptService {
     evidence.preValidationTree = preTree;
     evidence.postValidationTree = postTree;
     evidence.validationMutations = mutations;
+    const postRevalEscapes = findSymlinkEscapes(worktree);
+    if (postRevalEscapes.length > 0) evidence.symlinkEscapes = [...(evidence.symlinkEscapes ?? []), ...postRevalEscapes];
     this.applyIntegritySteps(validation, evidence, worktree, []);
     this.finishOp(valOp, validation.status === 'FAILED' ? 'failed' : 'succeeded');
 

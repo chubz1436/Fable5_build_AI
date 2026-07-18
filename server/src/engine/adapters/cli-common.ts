@@ -2,6 +2,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { FileChange } from '../../../../shared/types';
+import { killProcessTree, resolveExecutable, spawnSafe } from '../../attempts/runners';
+import { allowlistedChildEnv } from '../../attempts/env';
 import type { RunContext } from './types';
 
 /**
@@ -235,7 +237,13 @@ export async function detectCli(command: string, timeoutMs = 8000, attempts = 3)
   return null;
 }
 
-function probeVersion(command: string, timeoutMs: number): Promise<string | null> {
+async function probeVersion(command: string, timeoutMs: number): Promise<string | null> {
+  // No shell:true. Resolve to a real runnable via the hardened Windows-aware
+  // resolver, then launch it through spawnSafe (argv arrays, PATHEXT-correct
+  // .cmd handling) with an allowlisted environment — the exact machinery the
+  // attempt pipeline uses.
+  const resolved = await resolveExecutable(command);
+  if (!resolved) return null;
   return new Promise((resolve) => {
     let settled = false;
     const done = (v: string | null) => {
@@ -245,10 +253,14 @@ function probeVersion(command: string, timeoutMs: number): Promise<string | null
       }
     };
     try {
-      const proc = spawn(`${command} --version`, [], { shell: true, windowsHide: true });
+      const proc = spawnSafe(resolved, ['--version'], {
+        cwd: process.cwd(),
+        env: allowlistedChildEnv(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
       let out = '';
       const timer = setTimeout(() => {
-        killTree(proc);
+        killProcessTree(proc);
         done(null);
       }, timeoutMs);
       timer.unref?.();

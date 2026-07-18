@@ -2,6 +2,7 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { EventLevel, ExitReason } from '../../../shared/types';
+import { allowlistedChildEnv, CODEX_ENV_EXTRA } from './env';
 
 /**
  * Hardened worker runners for repository-backed attempts (P0.8).
@@ -169,6 +170,8 @@ export interface RunnerLaunch {
   timeoutMs: number;
   maxLogLines: number;
   onLog(line: string, level?: EventLevel): void;
+  /** parent environment to allowlist from (defaults to process.env; tests inject) */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface RunnerOutcome {
@@ -283,6 +286,7 @@ function runSession(
  *   [[FAIL]]  exit 2 without changes
  *   [[SECRET]] print a fake token (redaction path)
  *   [[TOUCH:rel/path]] additionally write that file
+ *   [[DUMPENV:VAR]] write ENV_DUMP.txt with VAR's value or ABSENT (env isolation)
  */
 const TEST_SCRIPT = `
 const fs = require('node:fs');
@@ -291,6 +295,8 @@ const goal = process.env.CC_GOAL || '';
 (async () => {
   console.log('test-runner: session started');
   if (goal.includes('[[SECRET]]')) console.log('leaked credential token=sk-verysecret1234567890 (should be redacted)');
+  const de = goal.match(/\\[\\[DUMPENV:([A-Za-z0-9_]+)\\]\\]/);
+  if (de) { const v = process.env[de[1]]; fs.writeFileSync('ENV_DUMP.txt', de[1] + '=' + (v === undefined ? 'ABSENT' : v) + '\\n'); console.log('test-runner: dumped env ' + de[1]); }
   if (goal.includes('[[SLOW]]')) { console.log('test-runner: sleeping'); await new Promise(r => setTimeout(r, 30000)); }
   if (goal.includes('[[FAIL]]')) { console.error('test-runner: simulated failure'); process.exit(2); }
   const m = goal.match(/\\[\\[TOUCH:([^\\]]+)\\]\\]/);
@@ -309,7 +315,9 @@ export class TestRunner implements WorkerRunner {
   }
 
   async start(launch: RunnerLaunch): Promise<RunnerHandle> {
-    const env = { ...process.env, CC_GOAL: launch.goal };
+    // the deterministic runner is held to the SAME env isolation as a real
+    // worker: allowlisted parent env + the one task variable it needs.
+    const env = { ...allowlistedChildEnv([], launch.env ?? process.env), CC_GOAL: launch.goal };
     const proc = spawn(process.execPath, ['-e', TEST_SCRIPT], {
       cwd: launch.worktree,
       env,
@@ -358,7 +366,7 @@ export class CodexRunner implements WorkerRunner {
       try {
         const proc = spawnSafe(resolved, ['--version'], {
           cwd: process.cwd(),
-          env: process.env,
+          env: allowlistedChildEnv(CODEX_ENV_EXTRA),
           stdio: ['ignore', 'pipe', 'pipe'],
         });
         let out = '';
@@ -404,10 +412,13 @@ export class CodexRunner implements WorkerRunner {
       ...(this.options.model ? ['-m', this.options.model] : []),
       '-',
     ];
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-    delete env.CLAUDE_CODE_ENTRYPOINT;
-    delete env.AUTH_TOKEN;
+    // Minimal ALLOWLISTED environment (never a blocklist): the base benign
+    // variables plus exactly the keys Codex needs to find its login and run.
+    // Arbitrary secrets in the parent process are excluded by construction.
+    //   - CODEX_HOME / OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_ORG* keep the
+    //     normal `codex login` (ChatGPT token or API key) flow working;
+    //   - CLAUDECODE / CLAUDE_CODE_ENTRYPOINT / AUTH_TOKEN are never inherited.
+    const env = allowlistedChildEnv(CODEX_ENV_EXTRA, launch.env ?? process.env);
 
     const proc = spawnSafe(resolved, args, {
       cwd: launch.worktree,
