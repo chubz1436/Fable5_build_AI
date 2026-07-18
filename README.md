@@ -125,6 +125,7 @@ gitignored: gitignored outputs are exempt from mutation detection by design.
 | `DATA_DIR`      | `./data`                   | database, worktrees, token                     |
 | `ATTEMPT_RUNNER`| `codex`                    | `test` = deterministic local runner            |
 | `CODEX_CLI` / `CODEX_MODEL` | `codex` / *(unset)* | executable + optional model allowlist  |
+| `CODEX_AUTH_MODE` | `login_file`             | `api_key` opts into passing `OPENAI_API_KEY` etc. |
 | `ATTEMPT_TIMEOUT_MS` | `900000`              | hard cap per worker run                        |
 | `APPROVAL_TTL_MS` | `1800000`               | start-grant validity                           |
 | `SIM_SPEED`     | `1`                        | demo simulation pacing                         |
@@ -132,7 +133,7 @@ gitignored: gitignored outputs are exempt from mutation detection by design.
 ## Testing
 
 ```bash
-npm test              # 98 tests: unit + API + full vertical-slice integration
+npm test              # 113 tests: unit + API + full vertical-slice integration
 npm run typecheck
 npm run build
 ```
@@ -155,14 +156,22 @@ symlink/junction escape scanning (fail-closed, external targets untouched),
 worker-env allowlisting (arbitrary parent secrets are never inherited),
 operation-status hygiene (no completed attempt leaves a running operation),
 and repository-attempt routing (only AttemptService-supported adapters).
+It also proves malicious `clean`/`smudge` filters never execute across
+checkout/staging/snapshot/diff/checkpoint (with a control run showing the
+driver really was active) and cannot read an injected secret, that a hook
+inserted into the hooks path after startup is never executed, that
+cancellation kills a **detached background descendant** before its delayed
+write lands, and that both Codex credential modes behave as specified.
 CI (GitHub Actions) runs on Ubuntu and Windows.
 
 ## Persistence & data
 
 SQLite (WAL) at `data/command-center.db` is the single authoritative store
 (projects, tasks, attempts, operations, leases, approvals, events, handoffs).
-A pre-existing `data/command-center.json` from v0.2 is imported once and left
-untouched. Back up by copying the `.db` file while the app is stopped.
+Attempt worktrees live under `data/worktrees/<attemptId>`. Back up by copying
+the `.db` file while the app is stopped. (A `data/command-center.json` left
+over from an older build is imported once on first boot and then ignored; it
+is never written to.)
 
 ## Security boundaries
 
@@ -173,19 +182,36 @@ untouched. Back up by copying the `.db` file while the app is stopped.
   `shell: true` anywhere in the execution path (CLI version detection included;
   it reuses the same hardened Windows-aware resolver + launcher as the attempt
   pipeline); validation commands are argv-allowlisted at registration.
-- **Every** git invocation is hardened: repository hooks are disabled via a
-  controlled empty `core.hooksPath` (a hostile repo's pre-commit/post-checkout
-  hook can never execute through us), external diff drivers are disabled
-  (`diff.external=` + `--no-ext-diff --no-textconv`), fsmonitor is off, and the
-  git environment cannot prompt for credentials, open an editor/pager, or reach
-  the network (SSH/askpass disabled).
+- **Every** git invocation is hardened, so a hostile repository cannot execute
+  code through us during checkout, staging, snapshots, diffing or checkpointing:
+  - repository **hooks** are disabled via a **private, randomized,
+    non-existent** `core.hooksPath` that is re-verified immediately before each
+    call and rotated if anything ever creates it (a worker cannot pre-populate
+    an unguessable path);
+  - **content filters** (`clean`, `smudge`, `process`) are neutralised — every
+    configured driver is enumerated and its commands cleared with
+    `required=false`, so `.gitattributes` cannot invoke anything;
+  - external diff drivers and textconv are disabled (`diff.external=` +
+    `--no-ext-diff --no-textconv`), attributes files are cleared
+    (`core.attributesFile=`, `GIT_ATTR_NOSYSTEM=1`), fsmonitor is off;
+  - the git environment is a minimal allowlist (never `process.env`) that
+    cannot prompt for credentials, open an editor/pager, or reach the network.
 - **Child-process environments are allowlists, never blocklists.** Validators
   get PATH/system-dirs/temp/locale and nothing else. The Codex worker gets that
-  base plus exactly the keys a normal `codex login` needs (`CODEX_HOME`,
-  `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG*`, `OPENAI_PROJECT`).
-  Arbitrary secrets in the app's own environment (including `AUTH_TOKEN` and
-  any `*_API_KEY`/`*_SECRET`) are excluded by construction. Logs are
-  secret-redacted before storage/display.
+  base plus only what its credential mode needs. Arbitrary secrets in the app's
+  environment (including `AUTH_TOKEN` and any `*_API_KEY`/`*_SECRET`) are
+  excluded by construction. Logs are secret-redacted before storage/display.
+- **Codex credentials default to the on-disk login** (`codex login`, located
+  via `CODEX_HOME`). An `OPENAI_API_KEY` sitting in the Command Center's
+  environment is **not** forwarded to the model subprocess unless the owner
+  explicitly opts in with `CODEX_AUTH_MODE=api_key`. The chosen mode is part of
+  the approved `ExecutionSpec`, so changing it invalidates outstanding grants.
+- **Cancellation kills the whole process tree and proves it.** On Windows the
+  tree is terminated with a single `taskkill /T /F` (never the `cmd.exe`
+  wrapper first, never a delayed kill, which would orphan the real worker); on
+  POSIX workers run in their own process group so the group is signalled.
+  Detached/background descendants are covered, and leases are released only
+  after the recorded pid is verified gone.
 - Attempts are confined to `data/worktrees/<attemptId>` (containment-checked).
   A **fail-closed** symlink/junction/reparse-point scan runs before the worker
   launches, before every validation command, before each checkpoint, and on
@@ -203,8 +229,9 @@ untouched. Back up by copying the `.db` file while the app is stopped.
   *scope* field is advisory only and is labeled as such on approvals;
   *protected paths* are enforced.
 - Repository attempts may run **only on adapters AttemptService can drive**
-  (Codex, or the deterministic test runner); any other adapter is refused at
-  request-start and never reaches execution.
+  (Codex, or the deterministic test runner). Intake never recommends an
+  ineligible worker for a git task, the UI disables them with a clear label,
+  and request-start refuses them before any approval or attempt is created.
 - No merge, no push, no LAN exposure, no telemetry.
 
 ## Known limitations
@@ -220,11 +247,15 @@ untouched. Back up by copying the `.db` file while the app is stopped.
 - Validation commands run with the owner's OS privileges — see “Validator
   execution risk” above; environment isolation and mutation detection reduce
   but do not eliminate that trust requirement.
-- The legacy workspace adapters (v0.2 demo path) are **quarantined**: their
-  code remains in `server/src/engine/adapters/` but the Engine never
-  instantiates the real ones, sample tasks always run the SimulatedAdapter,
-  and the Antigravity permission bypass defaults to OFF. They stay disabled
-  until migrated onto the hardened attempt pipeline.
+- The legacy workspace adapters are **quarantined**: their code remains in
+  `server/src/engine/adapters/` but the Engine never instantiates the real
+  ones, sample tasks always run the SimulatedAdapter, and the Antigravity
+  permission bypass defaults to OFF. They stay disabled until migrated onto
+  the hardened attempt pipeline.
+- Filter-driver *discovery* is cached per repository (re-enumerated at every
+  consequential phase boundary); the neutralising overrides themselves are
+  applied to every git call, and adding a driver requires a git-config change,
+  which the integrity baseline independently detects and blocks.
 - After a restart during CANCELLING, child-process termination cannot be
   re-verified; the attempt is settled as cancelled with an explicit note and
   the worktree is preserved for inspection.

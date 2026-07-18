@@ -11,31 +11,36 @@ A deliberately small, local-first two-tier app:
 └───────────────┬────────────────────────────▲───────────────────┘
                 │ REST (owner actions)       │ SSE /api/stream
 ┌───────────────▼────────────────────────────┴───────────────────┐
-│  Express 5 (single process, port 4680)                         │
+│  Express 5 (single process, loopback :4680, token-gated /api)  │
 │                                                                │
-│  api/routes ──► Engine (orchestrator; owns ALL state changes)  │
-│                   │  ▲                                         │
-│         RunContext│  │ adapter events (log/phase/progress/     │
-│                   ▼  │ requestApproval/blocked/finished)       │
-│               WorkerAdapter (simulated today)                  │
+│  api/routes ─┬─► AttemptService  — REAL repository execution   │
+│              │     exact grants, DB leases, isolated git       │
+│              │     worktrees, independent validation,          │
+│              │     durable checkpoints, recovery               │
+│              │                                                 │
+│              └─► Engine — SAMPLE projects only (SimulatedAdapter│
+│                    exclusively; no real CLI can run here)      │
 │                                                                │
-│  Store: JSON document, debounced atomic writes (tmp+rename),   │
-│         every mutation broadcast to SSE subscribers            │
+│  Store facade ──► SQLite (WAL, node:sqlite)                    │
+│         transactional; SSE broadcasts published after COMMIT   │
 └────────────────────────────────────────────────────────────────┘
-                data/command-center.json
+                data/command-center.db   +   data/worktrees/<attemptId>
 ```
 
 Design principles:
 
 1. **One source of truth** — `shared/types.ts` is imported by server and
    client; there is no duplicated model.
-2. **The engine owns state** — adapters *report*, the engine *decides*.
-   Every task transition goes through the lifecycle state machine
+2. **The orchestrator owns state** — runners/adapters *report*, the service
+   *decides*. Every task transition goes through the lifecycle state machine
    (`domain/lifecycle.ts`); illegal jumps are 409s, in tests and in the UI.
 3. **Everything explainable** — routing scores carry factor strings, risk
    levels carry rationales, approvals carry recommendations with reasons.
-4. **Local and safe by default** — no network calls, no credentials, no
-   writes outside the data file.
+4. **Evidence over claims** — deliveries are judged by the real git diff and
+   independently executed validation, never by what a worker says it did.
+5. **Local and safe by default** — loopback-only bind with a local access
+   token on every `/api` call; no telemetry; no merge or push; the owner's
+   working tree is never touched.
 
 ## Technology choices
 
@@ -44,7 +49,7 @@ Design principles:
 | Language     | TypeScript everywhere (strict)      | one model shared across tiers                              |
 | Backend      | Express 5 + tsx                     | tiny, no build step for the server                         |
 | Realtime     | Server-Sent Events                  | one-directional updates, auto-reconnect, no ws dependency  |
-| Persistence  | single JSON doc, atomic tmp+rename  | zero native deps, human-inspectable, adequate for 1 owner  |
+| Persistence  | SQLite WAL via built-in `node:sqlite`| zero native deps; real transactions, UNIQUE/partial-index guarantees |
 | Frontend     | React 19 + Vite + hand-rolled CSS   | fast, no UI-kit lock-in, full control of the ops aesthetic |
 | State (UI)   | useReducer store fed by SSE         | the server is the store; the client just mirrors it        |
 | Tests        | Vitest + supertest                  | unit + real-HTTP integration in one runner                 |
@@ -132,85 +137,77 @@ between (and during) steps, and follows documented scenario rules:
 - produces evidence artifacts (files + diff stats, test report, limitations,
   confidence) that are **labeled as simulated** in the delivery.
 
-### Real: `ClaudeCodeAdapter` and `CodexAdapter`
+### Real execution: `AttemptService` + `CodexRunner` (the only real path)
 
-Two real adapters drive locally installed coding CLIs. They share
-provider-agnostic machinery in `adapters/cli-common.ts` (workspace
-snapshot + real diff, task brief, final-report extraction, process
-tree-kill, CLI detection); each adapter adds only its own launch flags and
-stream parsing.
+Real work happens **only** on the repository-backed pipeline
+(`attempts/service.ts`), never through the Engine. `attempts/runners.ts`
+provides the runners:
 
-At boot, `enableRealAdapters()` (called only from the runtime entrypoint,
-never in tests) probes each CLI via `detectCli` — which retries a few times
-so a transient spawn failure under load doesn't misread an installed CLI as
-missing — and upgrades the matching worker (`wkr_claude_code` → `claude-code`,
-`wkr_codex` → `codex`), or reverts it to simulated (restoring its model
-label) with an event when the CLI is genuinely absent.
+- **`CodexRunner`** drives the locally installed `codex` CLI:
+  `codex exec --json --color never --skip-git-repo-check --sandbox
+  workspace-write [-m MODEL] -`, with the brief piped over **stdin** so no
+  task text ever reaches a command line. Codex may run shell commands inside
+  its sandbox while writes stay confined to the attempt worktree (passed as
+  `cwd`, never as an argument). Exit code 0 is success; failing exits are
+  refined into `auth_required` / `rate_limited` / `quota_exhausted` by
+  keyword, never the reverse.
+  Credentials: **`login_file` by default** — authentication comes from the
+  owner's on-disk `codex login` (under `CODEX_HOME`) and an `OPENAI_API_KEY`
+  present in the app's environment is *not* forwarded. `CODEX_AUTH_MODE=api_key`
+  is an explicit opt-in that additionally passes the API-key variables. The
+  chosen mode is recorded in the `ExecutionSpec`, so switching it invalidates
+  outstanding grants.
+- **`TestRunner`** (`ATTEMPT_RUNNER=test`) is a deterministic local runner
+  that spawns a real child process making real file changes — used by the
+  automated suite and for zero-token demos.
 
-**`ClaudeCodeAdapter`** (`adapters/claude-code.ts`) drives the Claude Code
-CLI.
+Both are launched through the hardened Windows-aware resolver + `spawnSafe`
+(argv arrays, PATHEXT-correct `.cmd` handling, never `shell: true`), with
+allowlisted environments, bounded and secret-redacted logs, hard timeouts,
+and whole-process-tree cancellation.
 
-Per run it: creates an isolated workspace under `data/workspaces/<taskId>/`,
-writes a `_TASK_BRIEF.md` (goal, criteria, retry note, handoff context,
-rules), pipes the prompt over **stdin** to `claude -p --output-format
-stream-json --verbose --permission-mode acceptEdits --allowedTools
-Write,Edit,Read,Glob,Grep` (file tools only — no Bash, no network), parses
-the stream-json events into live `ctx.log`/`ctx.progress` updates, and on
-success diffs before/after workspace snapshots so `filesChanged` reflects
-what actually happened on disk. The model's own self-report (a fenced JSON
-block in its final message) supplies only summary/limitations/confidence.
-Failures (not logged in, non-zero exit, timeout) map to `ctx.blocked` with
-the real error; cancel kills the process tree.
+### Quarantined: the legacy v0.2 workspace adapters
 
-**`CodexAdapter`** (`adapters/codex.ts`) drives `codex exec --json` with
-`--sandbox workspace-write --skip-git-repo-check -C <workspace> -o
-<lastMsgFile>`, the prompt piped over stdin. Unlike Claude Code (file tools
-only), Codex may run shell commands inside the sandbox — so it can execute
-the code it writes — while writes stay confined to the workspace. Its
-stream-json parser is intentionally defensive (correctness comes from the
-exit code, the `-o` final-message file, and the workspace diff, never from
-guessing the exact event schema), and nested Codex error shapes are
-flattened to a readable message. An optional `CODEX_MODEL` selects the model
-when the account default is unsuitable.
+`engine/adapters/claude-code.ts`, `codex.ts` and `antigravity.ts` remain in
+the tree but are **never instantiated**. They predate the hardened pipeline
+(no leases, no Attempt/Operation records, no exact grants, no independent
+verification) and are disabled until migrated onto `AttemptService`. The
+Engine registers the `SimulatedAdapter` only, so a sample task cannot spawn a
+real CLI regardless of what is installed or how a worker is configured; the
+Antigravity permission bypass additionally defaults to off.
 
-**`AntigravityAdapter`** (`adapters/antigravity.ts`) drives the Antigravity
-CLI (`agy --print`), which returns a PLAIN-TEXT response (no JSON stream), so
-the adapter streams stdout lines straight into the log and reads the fenced
-json report from the accumulated text. `agy` cannot edit files in headless
-mode unless permissions are auto-approved, so the adapter runs `--sandbox`
-(terminal restrictions) **plus** `--dangerously-skip-permissions`, confined
-to the workspace via cwd + `--add-dir`. This is broader than the file-only
-Claude Code adapter; it is gated by the owner's start-approval and is
-disableable via `ANTIGRAVITY_SKIP_PERMISSIONS=0` (runs then block with an
-actionable message instead of silently doing nothing). The full brief is
-written to `_TASK_BRIEF.md` and referenced by a short, fixed prompt so no
-task text is interpolated into the shell command line.
+Boot-time `enableRealAdapters()` still probes for installed CLIs via
+`detectCli` (itself shell-free, reusing the hardened resolver/launcher), but
+its only effect is honest readiness reporting and marking which workers are
+eligible for **repository** attempts.
 
-Honesty guarantees (all real adapters): `RunResult.checks` may contain only
-checks that actually ran, and `criteriaMet: null` leaves acceptance criteria
-unjudged so the delivery review tells the owner to inspect the files. Real
-processes can't be paused portably, so the adapters declare
-`capabilities.pause = false` and the engine refuses pause requests with a
-clear message.
-
-Requirements: one-time login by the owner (`claude /login`, `codex login`,
-Antigravity app login). Only **Hermes** remains simulated (no local CLI);
-adding a real adapter for it (a local model over HTTP) follows the same
-recipe — nothing in the engine, API, store, or UI changes.
+Honesty guarantees: acceptance criteria are left unjudged (`met: null`) so the
+owner inspects the real diff; real processes cannot be paused portably, so
+pause is refused for repository attempts with a clear message.
 
 ## API surface
 
+Every `/api` route requires the local access token.
+
 ```
-GET  /api/state                      full snapshot (bootstrap)
-GET  /api/stream                     SSE: task/worker/approval/handoff/event patches
-POST /api/tasks/parse                NL text → structured TaskDraft (no side effects)
+GET  /api/state                      full snapshot (bootstrap; includes
+                                     system.repoCapableWorkerIds for the UI)
+GET  /api/stream                     SSE: task/worker/approval/attempt/project patches
+POST /api/tasks/parse                NL text → structured TaskDraft (no side effects;
+                                     git projects rank only repo-capable workers)
 POST /api/tasks                      create task from (edited) draft → status ready
-GET  /api/tasks/:id                  task + its events/approvals/handoffs
+GET  /api/tasks/:id                  task + its events/approvals/handoffs/attempts/operations
 POST /api/tasks/:id/promote          backlog → ready
 POST /api/tasks/:id/request-start    assign worker (or recommended) → start approval
 POST /api/tasks/:id/pause|resume|cancel|retry
 POST /api/tasks/:id/reassign         {workerId, reason} → structured handoff → run
 POST /api/approvals/:id/decision     {decision: approve|reject, note?}
+POST /api/projects/register          register a local git repository
+POST /api/projects/:id/recheck       re-verify repo health
+PATCH /api/projects/:id              enable/disable, validation commands, protected paths
+GET  /api/attempts/:id               attempt + its operations
+POST /api/attempts/:id/revalidate    re-run validation only (never the worker)
+POST /api/attempts/:id/cleanup       {confirmDiscard?} remove worktree (branch kept)
 GET  /api/health
 ```
 
@@ -233,11 +230,18 @@ mutation to SSE subscribers.
 
 ## Security boundaries
 
-- Binds to localhost; single owner; no auth by design.
-- No secrets, tokens, or external endpoints anywhere.
-- Simulated execution cannot write files; the only disk artifact is the data
-  file. Real adapters must keep the isolated-workspace + approval-gate
-  contract described above.
+- Binds to loopback only; every `/api` request requires the local access
+  token (session cookie or `Authorization: Bearer`), mutating requests are
+  origin-checked, and a non-loopback bind refuses to start without an
+  explicit `AUTH_TOKEN`.
+- No telemetry and no external endpoints. Worker/validator/git subprocesses
+  receive allowlisted environments, so app secrets are never inherited.
+- Simulated execution cannot write files. Real execution writes only inside
+  `data/worktrees/<attemptId>`, behind an exact approval grant.
+- Every git invocation runs with repository hooks disabled (private
+  randomized, re-verified hooks path), content filters (clean/smudge/process)
+  neutralised, external diff/textconv disabled, and a minimal allowlisted
+  environment — a hostile repository cannot execute code through us.
 - The UI never executes worker-provided content; logs are rendered as text.
 
 ## Simulated vs real, precisely
@@ -254,8 +258,9 @@ mutation to SSE subscribers.
 | Durable checkpoint commits + loss-refusing cleanup                       |                                                    |
 | Authoritative cancellation (CANCELLING; proven termination)              |                                                    |
 | Crash reconciliation (`unknown_outcome`, re-validate without re-run)     |                                                    |
-| Hardened git (hooks/ext-diff off) + baseline tamper detection            |                                                    |
-| Allowlisted worker/validator env; fail-closed symlink escape scan        |                                                    |
+| Hardened git (hooks/filters/ext-diff off) + baseline tamper detection    |                                                    |
+| Allowlisted worker/validator/git env; fail-closed symlink escape scan    |                                                    |
+| Codex login-file credentials by default (API-key env is opt-in)         |                                                    |
 | Local security boundary (loopback + token + origin + zod)                |                                                    |
 | Transactional SSE live updates; full REST API + 98 tests                 |                                                    |
 
