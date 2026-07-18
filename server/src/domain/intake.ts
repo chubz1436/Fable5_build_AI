@@ -128,6 +128,8 @@ export function parseGoal(
   projects: Project[],
   workers: WorkerProfile[],
   explicitProjectId?: string,
+  /** workers AttemptService can drive; enforced for git-backed projects */
+  repoCapableWorkerIds?: string[],
 ): TaskDraft {
   const trimmed = text.trim();
   if (!trimmed) throw new IntakeError('Goal text is empty.');
@@ -144,7 +146,13 @@ export function parseGoal(
   const scope = [...new Set(tags.map((t) => SCOPE_BY_TAG[t]).filter((s): s is string => !!s))];
   if (scope.length === 0) scope.push('src/');
 
-  const recommendation = recommendWorker({ tags, risk, priority }, workers);
+  // a repository-backed task may only be routed to a worker AttemptService can
+  // actually drive — never recommend one that request-start would refuse
+  const recommendation = recommendWorker(
+    { tags, risk, priority },
+    workers,
+    project.kind === 'git' ? repoCapableWorkerIds : undefined,
+  );
 
   return {
     title: makeTitle(trimmed),

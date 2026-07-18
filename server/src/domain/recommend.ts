@@ -19,13 +19,25 @@ export interface RoutingInput {
 export function recommendWorker(
   input: RoutingInput,
   workers: WorkerProfile[],
+  /**
+   * When present, only these workers may be recommended or ranked. Repository
+   * (git) tasks pass the AttemptService-supported set so the UI can never
+   * recommend a worker that would be refused at request-start.
+   */
+  eligibleWorkerIds?: string[],
 ): WorkerRecommendation {
-  const scored = workers.map((w) => scoreWorker(input, w));
+  const eligible = eligibleWorkerIds
+    ? workers.filter((w) => eligibleWorkerIds.includes(w.id))
+    : workers;
+  if (eligible.length === 0) {
+    throw new Error('No worker is available for repository-backed execution.');
+  }
+  const scored = eligible.map((w) => scoreWorker(input, w));
   scored.sort((a, b) => b.score - a.score);
 
   const top = scored[0];
   if (!top) throw new Error('No workers registered.');
-  const winner = workers.find((w) => w.id === top.workerId)!;
+  const winner = eligible.find((w) => w.id === top.workerId)!;
 
   return {
     workerId: top.workerId,

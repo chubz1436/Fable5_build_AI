@@ -97,10 +97,13 @@ export function createRoutes(ctx: AppContext): Router {
 
   // -- intake -----------------------------------------------------------------
 
+  const repoCapableWorkerIds = (): string[] =>
+    store.workers.filter((w) => attempts.supportsRepositoryAttempts(w)).map((w) => w.id);
+
   router.post('/tasks/parse', (req, res) => {
     const input = body(ParseBody, req, res);
     if (!input) return;
-    const draft = parseGoal(input.text, store.projects, store.workers, input.projectId);
+    const draft = parseGoal(input.text, store.projects, store.workers, input.projectId, repoCapableWorkerIds());
     res.json(draft);
   });
 

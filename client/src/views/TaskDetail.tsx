@@ -82,8 +82,13 @@ export function TaskDetail() {
     }
   };
 
+  const repoCapable = store.system?.repoCapableWorkerIds ?? [];
   const idleWorkers = store.workers.filter(
-    (w) => w.availability === 'idle' && w.id !== task.assignedWorkerId,
+    (w) =>
+      w.availability === 'idle' &&
+      w.id !== task.assignedWorkerId &&
+      // reassignment targets for a repository task must be drivable too
+      (!task.gitProjectId || repoCapable.includes(w.id)),
   );
   const isActive = ['running', 'verifying', 'paused'].includes(task.status);
 
@@ -131,9 +136,17 @@ export function TaskDetail() {
                 </option>
                 {store.workers
                   .filter((w) => w.id !== task.recommendation?.workerId)
-                  .map((w) => (
-                    <option key={w.id} value={w.id}>{w.avatar} {w.name}</option>
-                  ))}
+                  .map((w) => {
+                    // repository tasks may only run on AttemptService-supported
+                    // adapters — anything else is disabled with a clear label
+                    const unsupported = !!task.gitProjectId && !repoCapable.includes(w.id);
+                    return (
+                      <option key={w.id} value={w.id} disabled={unsupported}>
+                        {w.avatar} {w.name}
+                        {unsupported ? ' — unavailable for repository tasks' : ''}
+                      </option>
+                    );
+                  })}
               </select>
             </>
           )}

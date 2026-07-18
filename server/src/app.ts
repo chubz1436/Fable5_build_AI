@@ -65,6 +65,9 @@ export function createContext(overrides: Partial<AppConfig> = {}): AppContext {
         engine: hasReal ? 'simulated + real adapters' : 'simulated',
         simSpeed: config.simSpeed,
         dataFile: config.dbFile,
+        repoCapableWorkerIds: store.workers
+          .filter((w) => attempts.supportsRepositoryAttempts(w))
+          .map((w) => w.id),
       };
     },
   };
