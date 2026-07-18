@@ -15,7 +15,7 @@ merged or pushed automatically, and the owner's working tree is never touched.
 | Git worktree isolation per attempt  | **Real** |
 | Exact single-use approval grants    | **Real** (bound to the full canonical **ExecutionSpec** — goal, scope, criteria, risk, worker, model, repo, base commit, validation commands, protected paths, timeouts, sandbox — re-verified inside the consuming transaction) |
 | Durable delivery checkpoints        | **Real** (app-generated commit on the attempt branch before review; cleanup refuses to destroy un-checkpointed work) |
-| Authoritative cancellation          | **Real** (`cancelling` state; leases released only after child-process termination is proven) |
+| Authoritative cancellation          | **Real** — the whole captured PID tree is verified dead before anything settles; unprovable termination becomes `cancellation_failed` with leases still held |
 | Transactional SSE broadcasts        | **Real** (buffered until COMMIT; discarded on rollback) |
 | Task → Attempt → Operation history  | **Real** (SQLite WAL, durable) |
 | Concurrency leases (task/worker/repo) | **Real** (DB unique constraints) |
@@ -68,9 +68,13 @@ The token persists in `data/auth-token.txt`. Every `/api` request requires it
    task/worker/repo **leases**, creates branch `cc/<attemptId>` and an
    isolated worktree under `data/worktrees/`, and starts the worker there.
 5. The worker runs (Codex CLI, or the deterministic test runner); events
-   stream live. Cancelling puts the attempt into **CANCELLING**, kills the
-   whole process tree, and only releases leases / settles the task once
-   termination is actually proven.
+   stream live. Cancelling puts the attempt into **CANCELLING** and kills the
+   whole captured process tree. The task is settled as **CANCELLED** and its
+   leases released **only** once every tracked pid is confirmed dead. If that
+   cannot be proven within the limit the attempt becomes
+   **CANCELLATION_FAILED**: the leases stay held, the worker stays busy, the
+   surviving pids are listed, and nothing claims the processes were stopped.
+   Cancelling again retries termination once you have dealt with them.
 6. The Command Center snapshots the worktree, then **independently runs your
    validation commands** with a **minimal allowlisted environment** (no
    secrets inherited). A second snapshot detects **every file validation
@@ -133,7 +137,7 @@ gitignored: gitignored outputs are exempt from mutation detection by design.
 ## Testing
 
 ```bash
-npm test              # 113 tests: unit + API + full vertical-slice integration
+npm test              # 118 tests: unit + API + full vertical-slice integration
 npm run typecheck
 npm run build
 ```
@@ -206,12 +210,17 @@ is never written to.)
   environment is **not** forwarded to the model subprocess unless the owner
   explicitly opts in with `CODEX_AUTH_MODE=api_key`. The chosen mode is part of
   the approved `ExecutionSpec`, so changing it invalidates outstanding grants.
-- **Cancellation kills the whole process tree and proves it.** On Windows the
-  tree is terminated with a single `taskkill /T /F` (never the `cmd.exe`
-  wrapper first, never a delayed kill, which would orphan the real worker); on
-  POSIX workers run in their own process group so the group is signalled.
-  Detached/background descendants are covered, and leases are released only
-  after the recorded pid is verified gone.
+- **Cancellation kills the whole process tree and proves it.** The descendant
+  closure is captured *before* the kill (afterwards the parent links are
+  gone). On Windows the tree is terminated with a single `taskkill /T /F`
+  (never the `cmd.exe` wrapper first, never a delayed kill, which would orphan
+  the real worker) and then **every captured pid is re-verified**, not just the
+  root; on POSIX workers *and validation commands* run in their own process
+  groups, so the group is signalled and group emptiness is checked.
+  `EPERM` on a probe means the process exists, so it counts as alive.
+  Task/worker/repo leases are released only when every tracked pid is
+  confirmed dead; otherwise the attempt lands in `cancellation_failed` with
+  the surviving pids recorded and the leases still held.
 - Attempts are confined to `data/worktrees/<attemptId>` (containment-checked).
   A **fail-closed** symlink/junction/reparse-point scan runs before the worker
   launches, before every validation command, before each checkpoint, and on
@@ -257,8 +266,10 @@ is never written to.)
   applied to every git call, and adding a driver requires a git-config change,
   which the integrity baseline independently detects and blocks.
 - After a restart during CANCELLING, child-process termination cannot be
-  re-verified; the attempt is settled as cancelled with an explicit note and
-  the worktree is preserved for inspection.
+  re-verified (the handles are gone and a recorded pid may have been reused),
+  so the attempt is reconciled to **CANCELLATION_FAILED** with its leases
+  still held rather than being reported as cancelled. Terminate any surviving
+  pids, then cancel again to settle it.
 
 ## Next milestone
 

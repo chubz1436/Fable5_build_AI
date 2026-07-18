@@ -8,6 +8,7 @@ const STATE_TONE: Record<string, string> = {
   running: 'b-accent',
   validating: 'b-accent',
   cancelling: 'b-warning',
+  cancellation_failed: 'b-danger',
   ready_for_review: 'b-success',
   accepted: 'b-success',
   rejected: 'b-warning',
@@ -40,7 +41,11 @@ export function AttemptPanel({ attempt, operations }: { attempt: Attempt; operat
       setBusy(false);
     }
   };
-  const terminal = !['creating_worktree', 'running', 'validating', 'cancelling'].includes(attempt.state);
+  // an attempt whose cancellation was never confirmed is NOT terminal: its
+  // processes may still be running and its leases are deliberately held
+  const terminal = !['creating_worktree', 'running', 'validating', 'cancelling', 'cancellation_failed'].includes(
+    attempt.state,
+  );
   // truthful cleanup semantics (P0-2): with a checkpoint the work survives on
   // the branch; without one, removal permanently destroys uncommitted work.
   const hasCheckpoint = !!attempt.checkpointCommit;
@@ -81,6 +86,18 @@ export function AttemptPanel({ attempt, operations }: { attempt: Attempt; operat
           <>
             <dt>Reason</dt>
             <dd className="small" style={{ color: 'var(--danger)' }}>{attempt.failureReason}</dd>
+          </>
+        )}
+        {attempt.terminationProof && (
+          <>
+            <dt>Termination</dt>
+            <dd className="small" style={{ color: attempt.terminationProof.proven ? undefined : 'var(--danger)' }}>
+              {attempt.terminationProof.proven ? '✓ proven — ' : '⚠ NOT proven — '}
+              {attempt.terminationProof.detail}
+              {attempt.terminationProof.livePids.length > 0 && (
+                <span className="mono"> (live pids: {attempt.terminationProof.livePids.join(', ')})</span>
+              )}
+            </dd>
           </>
         )}
       </dl>

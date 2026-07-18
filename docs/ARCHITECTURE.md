@@ -262,7 +262,7 @@ mutation to SSE subscribers.
 | Allowlisted worker/validator/git env; fail-closed symlink escape scan    |                                                    |
 | Codex login-file credentials by default (API-key env is opt-in)         |                                                    |
 | Local security boundary (loopback + token + origin + zod)                |                                                    |
-| Transactional SSE live updates; full REST API + 98 tests                 |                                                    |
+| Transactional SSE live updates; full REST API + 118 tests                |                                                    |
 
 ## Repository-backed execution (v0.3)
 

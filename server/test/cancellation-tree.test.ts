@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CodexRunner, pidAlive, type RunnerLaunch } from '../src/attempts/runners';
+import { captureProcessTree, CodexRunner, pidAlive, type RunnerLaunch } from '../src/attempts/runners';
 
 const WIN = process.platform === 'win32';
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -67,22 +67,32 @@ describe('process-tree cancellation (detached descendants)', () => {
     expect(spawnLine, 'fake worker never spawned its background child').toBeTruthy();
     const childPid = Number(spawnLine!.match(/pid=(\d+)/)?.[1]);
     expect(Number.isInteger(childPid)).toBe(true);
+    // wait for the descendant to actually appear in the OS process table —
+    // polling instead of a fixed sleep is what makes this reliable under load
+    const upBy = Date.now() + 10_000;
+    while (!pidAlive(childPid) && Date.now() < upBy) await new Promise((r) => setTimeout(r, 50));
     expect(pidAlive(childPid), 'background child should be alive before cancellation').toBe(true);
+    // and it must be captured as part of the tree BEFORE we kill anything
+    const captured = await captureProcessTree(handle.pid!);
+    expect(captured, 'descendant must be captured before the kill').toContain(childPid);
 
-    // cancel() must resolve only once the whole tree is proven down
-    await handle.cancel();
+    // cancel() must resolve only once the WHOLE tree is proven down
+    const proof = await handle.cancel();
+    expect(proof.proven, `termination not proven: ${proof.detail}`).toBe(true);
+    expect(proof.captured).toContain(childPid);
+    expect(proof.livePids).toEqual([]);
+
     const outcome = await handle.done;
     expect(outcome.exitReason).toBe('cancelled');
     expect(pidAlive(handle.pid), 'root process still alive after cancel').toBe(false);
-
-    // the descendant itself must be gone, and its delayed write (6s) must
-    // never land
     expect(pidAlive(childPid), 'detached descendant survived cancellation').toBe(false);
+
+    // and its delayed write (6s after spawn) must never land
     await new Promise((r) => setTimeout(r, 7000));
     expect(fs.existsSync(marker), 'detached child survived cancellation and wrote its marker').toBe(false);
     // the parent's own slow output must also be absent
     expect(fs.existsSync(path.join(worktree, 'sum.js'))).toBe(false);
-  }, 40_000);
+  }, 60_000);
 
   it('cancel() is idempotent and still resolves when the tree is already gone', async () => {
     const cmd = makeFakeCodex(path.join(tmp(), 'idem dir'));

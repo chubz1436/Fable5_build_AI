@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite';
  *  - WAL mode gives crash-safe writes; each statement is durable.
  */
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -80,9 +80,11 @@ CREATE TABLE IF NOT EXISTS attempts (
   started_at     TEXT NOT NULL,
   json           TEXT NOT NULL
 );
--- hard guarantee: one active attempt per task ('cancelling' still holds it)
+-- hard guarantee: one active attempt per task. 'cancelling' and
+-- 'cancellation_failed' still count as active: their processes may be alive,
+-- so they keep holding their leases.
 CREATE UNIQUE INDEX IF NOT EXISTS attempts_one_active ON attempts(task_id)
-  WHERE state IN ('creating_worktree','running','validating','cancelling');
+  WHERE state IN ('creating_worktree','running','validating','cancelling','cancellation_failed');
 CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
 
 CREATE TABLE IF NOT EXISTS operations (
@@ -154,13 +156,14 @@ export class Db {
       );
     }
     if (current < SCHEMA_VERSION) {
-      if (current < 2) {
-        // v2: the one-active-attempt index must also cover 'cancelling'
-        // (CREATE INDEX IF NOT EXISTS never updates an existing definition)
+      if (current < 3) {
+        // v2 added 'cancelling'; v3 adds 'cancellation_failed' — both keep
+        // holding leases. CREATE INDEX IF NOT EXISTS never updates an existing
+        // definition, so the index is rebuilt.
         this.sqlite.exec('DROP INDEX IF EXISTS attempts_one_active');
         this.sqlite.exec(
           "CREATE UNIQUE INDEX attempts_one_active ON attempts(task_id) " +
-            "WHERE state IN ('creating_worktree','running','validating','cancelling')",
+            "WHERE state IN ('creating_worktree','running','validating','cancelling','cancellation_failed')",
         );
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));

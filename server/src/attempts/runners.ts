@@ -156,66 +156,238 @@ export function spawnSafe(
 }
 
 /**
- * Terminate the ENTIRE process tree and resolve only once termination is
- * PROVEN (cancellation must be authoritative).
+ * True when the pid still exists. Signal 0 only probes.
  *
- * Windows: `taskkill /T /F` walks the descendant tree and kills it in one
- * shot. We never kill the cmd.exe wrapper first — doing so orphans the real
- * worker and its children, which then survive the "cancellation". We await
- * taskkill's exit, then confirm the root pid is gone.
- *
- * POSIX: workers are spawned detached (own process group), so a negative pid
- * signals the whole group — background/detached descendants included.
+ * IMPORTANT: `EPERM` means the process EXISTS but we may not signal it — that
+ * is very much alive. Only `ESRCH` (no such process) proves death. Treating
+ * EPERM as "dead" would let cancellation report success over a surviving
+ * process it simply lacks permission to touch.
  */
-export function killProcessTree(proc: ChildProcess): Promise<void> {
-  const pid = proc.pid;
-  if (pid == null) return Promise.resolve();
-  if (WIN) {
-    return new Promise<void>((resolve) => {
-      let settled = false;
-      const done = () => {
-        if (!settled) {
-          settled = true;
-          resolve();
-        }
-      };
-      try {
-        const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-        killer.on('error', done);
-        killer.on('close', done);
-      } catch {
-        done();
-      }
-      // never hang cancellation on a wedged taskkill
-      setTimeout(done, 10_000).unref?.();
-    });
-  }
-  return new Promise<void>((resolve) => {
-    const signalGroup = (sig: NodeJS.Signals) => {
-      try {
-        process.kill(-pid, sig); // negative pid → the whole process group
-      } catch {
-        try {
-          proc.kill(sig);
-        } catch {
-          /* already gone */
-        }
-      }
-    };
-    signalGroup('SIGKILL');
-    resolve();
-  });
-}
-
-/** true when the pid is no longer alive */
 export function pidAlive(pid: number | null | undefined): boolean {
   if (pid == null) return false;
   try {
     process.kill(pid, 0);
     return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * The result of a termination attempt. `proven` is true ONLY when every pid we
+ * captured is confirmed dead. Callers must not settle a cancellation or
+ * release leases on an unproven result — an uncertain kill is a failure, not a
+ * success.
+ */
+export interface TerminationProof {
+  proven: boolean;
+  /** every pid we knew about: the root plus its captured descendants */
+  captured: number[];
+  /** pids still alive when the deadline expired */
+  livePids: number[];
+  detail: string;
+}
+
+/** snapshot of (pid, ppid) for every process on the machine */
+async function listProcesses(): Promise<Array<{ pid: number; ppid: number }> | null> {
+  const run = (file: string, args: string[]): Promise<string | null> =>
+    new Promise((resolve) => {
+      try {
+        execFile(file, args, { windowsHide: true, timeout: 10_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout) =>
+          resolve(err ? null : stdout),
+        );
+      } catch {
+        resolve(null);
+      }
+    });
+
+  if (WIN) {
+    // wmic first (fast, present on most builds), PowerShell CIM as fallback
+    const wmic = await run('wmic', ['process', 'get', 'ProcessId,ParentProcessId', '/format:csv']);
+    const parsed = wmic ? parseWinCsv(wmic) : null;
+    if (parsed?.length) return parsed;
+    const ps = await run('powershell.exe', [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Csv -NoTypeInformation',
+    ]);
+    return ps ? parseWinCsv(ps) : null;
+  }
+
+  const out = await run('ps', ['-eo', 'pid=,ppid=']);
+  if (!out) return null;
+  const rows: Array<{ pid: number; ppid: number }> = [];
+  for (const line of out.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]) });
+  }
+  return rows.length ? rows : null;
+}
+
+/** parse either the wmic CSV (Node,ParentProcessId,ProcessId) or CIM CSV */
+function parseWinCsv(text: string): Array<{ pid: number; ppid: number }> {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const header = lines.shift();
+  if (!header) return [];
+  const cols = header.split(',').map((c) => c.replaceAll('"', '').trim().toLowerCase());
+  const pidIdx = cols.indexOf('processid');
+  const ppidIdx = cols.indexOf('parentprocessid');
+  if (pidIdx === -1 || ppidIdx === -1) return [];
+  const rows: Array<{ pid: number; ppid: number }> = [];
+  for (const line of lines) {
+    const parts = line.split(',').map((p) => p.replaceAll('"', '').trim());
+    const pid = Number(parts[pidIdx]);
+    const ppid = Number(parts[ppidIdx]);
+    if (Number.isInteger(pid) && Number.isInteger(ppid)) rows.push({ pid, ppid });
+  }
+  return rows;
+}
+
+/**
+ * Capture the full descendant closure of `rootPid` BEFORE killing anything —
+ * once the tree is torn down the parent links are gone, so a post-kill
+ * enumeration cannot tell us what we were supposed to have killed.
+ */
+export async function captureProcessTree(rootPid: number): Promise<number[]> {
+  const captured = new Set<number>([rootPid]);
+  const rows = await listProcesses();
+  if (!rows) return [...captured];
+  const childrenOf = new Map<number, number[]>();
+  for (const { pid, ppid } of rows) {
+    if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
+    childrenOf.get(ppid)!.push(pid);
+  }
+  const queue = [rootPid];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const child of childrenOf.get(current) ?? []) {
+      if (child === current || captured.has(child)) continue;
+      captured.add(child);
+      queue.push(child);
+    }
+  }
+  return [...captured];
+}
+
+/** true when the POSIX process group led by `pgid` still has members */
+function groupAlive(pgid: number): boolean {
+  if (WIN) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Terminate a process tree and PROVE it is gone.
+ *
+ *   1. capture the whole descendant closure while the links still exist;
+ *   2. kill — Windows: one `taskkill /T /F` on the root (never the cmd.exe
+ *      wrapper first, never a delayed kill, which orphans the real worker);
+ *      POSIX: signal the process GROUP (children are spawned detached so they
+ *      lead their own group), which reaches detached/background descendants;
+ *   3. poll until EVERY captured pid is dead (and, on POSIX, the group is
+ *      empty) or the deadline expires.
+ *
+ * A deadline expiry returns `proven: false` with the surviving pids. Callers
+ * must treat that as a failed cancellation.
+ */
+export async function terminateTree(proc: ChildProcess, deadlineMs = 15_000): Promise<TerminationProof> {
+  const pid = proc.pid;
+  if (pid == null) {
+    return { proven: true, captured: [], livePids: [], detail: 'process was never started' };
+  }
+  const captured = await captureProcessTree(pid);
+
+  const kill = async (): Promise<void> => {
+    if (WIN) {
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        try {
+          const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+          killer.on('error', done);
+          killer.on('close', done);
+        } catch {
+          done();
+        }
+        setTimeout(done, 10_000).unref?.();
+      });
+      // sweep any captured descendant taskkill could not reach through the tree
+      for (const p of captured) {
+        if (p !== pid && pidAlive(p)) {
+          await new Promise<void>((resolve) => {
+            try {
+              const k = spawn('taskkill', ['/pid', String(p), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+              k.on('error', () => resolve());
+              k.on('close', () => resolve());
+            } catch {
+              resolve();
+            }
+          });
+        }
+      }
+      return;
+    }
+    // POSIX: the group first (covers detached descendants), then stragglers
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+    for (const p of captured) {
+      if (pidAlive(p)) {
+        try {
+          process.kill(p, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  };
+
+  await kill();
+
+  // verify the COMPLETE captured tree, not just the root
+  const deadline = Date.now() + deadlineMs;
+  let livePids = captured.filter((p) => pidAlive(p));
+  let groupStillAlive = !WIN && groupAlive(pid);
+  let sweeps = 0;
+  while ((livePids.length > 0 || groupStillAlive) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (++sweeps % 10 === 0) await kill(); // periodic re-kill for stubborn trees
+    livePids = captured.filter((p) => pidAlive(p));
+    groupStillAlive = !WIN && groupAlive(pid);
+  }
+
+  const proven = livePids.length === 0 && !groupStillAlive;
+  return {
+    proven,
+    captured,
+    livePids,
+    detail: proven
+      ? `all ${captured.length} captured process(es) confirmed dead`
+      : `${livePids.length} of ${captured.length} captured process(es) still alive after ${deadlineMs}ms` +
+        (groupStillAlive ? ' (process group still has members)' : '') +
+        (livePids.length ? `: pids ${livePids.join(', ')}` : ''),
+  };
+}
+
+/** fire-and-forget termination used by timeout paths (proof not required) */
+export function killProcessTree(proc: ChildProcess): Promise<void> {
+  return terminateTree(proc, 5_000).then(() => undefined);
 }
 
 // -- runner contract -----------------------------------------------------------
@@ -244,8 +416,11 @@ export interface RunnerHandle {
   executablePath: string | null;
   version: string | null;
   done: Promise<RunnerOutcome>;
-  /** resolves only once the whole process tree is proven terminated */
-  cancel(): Promise<void>;
+  /**
+   * Terminate the process tree and report whether termination was PROVEN.
+   * An unproven result must never be treated as a successful cancellation.
+   */
+  cancel(): Promise<TerminationProof>;
 }
 
 export interface WorkerRunner {
@@ -260,7 +435,7 @@ function runSession(
   proc: ChildProcess,
   launch: RunnerLaunch,
   classifyExit: (code: number | null, text: string, flags: { cancelled: boolean; timedOut: boolean }) => ExitReason,
-): { done: Promise<RunnerOutcome>; cancel(): Promise<void> } {
+): { done: Promise<RunnerOutcome>; cancel(): Promise<TerminationProof> } {
   const tail: string[] = [];
   let lineCount = 0;
   let cancelled = false;
@@ -323,18 +498,20 @@ function runSession(
   return {
     done,
     /**
-     * Authoritative cancellation: kill the WHOLE tree immediately (never the
-     * cmd.exe wrapper first, never a delayed taskkill — that orphans the real
-     * worker and its background children), then wait for the process to close
-     * so the caller can prove termination before settling state.
+     * Authoritative cancellation: capture the whole tree, kill it immediately
+     * (never the cmd.exe wrapper first, never a delayed taskkill — that
+     * orphans the real worker and its background children), then verify EVERY
+     * captured pid is dead. The returned proof tells the caller whether it may
+     * settle the cancellation at all.
      */
-    async cancel(): Promise<void> {
+    async cancel(): Promise<TerminationProof> {
       cancelled = true;
-      await killProcessTree(proc);
+      const proof = await terminateTree(proc);
       await Promise.race([
         done.then(() => undefined),
-        new Promise<void>((r) => setTimeout(r, 15_000).unref?.()),
+        new Promise<void>((r) => setTimeout(r, 5_000).unref?.()),
       ]);
+      return proof;
     },
   };
 }
@@ -459,7 +636,9 @@ export class CodexRunner implements WorkerRunner {
         pid: null,
         executablePath: null,
         version: null,
-        async cancel() {},
+        async cancel(): Promise<TerminationProof> {
+          return { proven: true, captured: [], livePids: [], detail: 'worker was never launched' };
+        },
         done: Promise.resolve({
           exitReason: 'unavailable',
           exitCode: null,

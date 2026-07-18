@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'node:child_process';
 import type {
   AttemptValidation,
   ValidationCommand,
@@ -48,6 +49,12 @@ export interface RunValidationOptions {
    * junction escapes before every command (fail-closed containment).
    */
   beforeCommand?: () => string | null;
+  /**
+   * Called with every spawned validation process so the caller can track it and
+   * PROVE its whole tree is dead on cancellation. Called again (same process)
+   * when it closes, so the tracker can forget it.
+   */
+  onProcess?: (proc: ChildProcess, event: 'spawned' | 'closed') => void;
 }
 
 export async function runValidation(
@@ -56,7 +63,7 @@ export async function runValidation(
   onLog: (line: string, level?: 'info' | 'warning' | 'error') => void,
   options: RunValidationOptions = {},
 ): Promise<AttemptValidation> {
-  const { signal, beforeCommand } = options;
+  const { signal, beforeCommand, onProcess } = options;
   if (commands.length === 0) {
     onLog('[verify] no validation commands configured — result is UNVERIFIED', 'warning');
     return { status: 'UNVERIFIED', steps: [], completedAt: nowIso() };
@@ -129,11 +136,16 @@ export async function runValidation(
               cwd: worktree,
               env,
               stdio: ['ignore', 'pipe', 'pipe'],
+              // POSIX: own process group so cancellation can kill the WHOLE
+              // group (a validator's background children included) without
+              // signalling the Command Center itself
+              detached: true,
             });
           } catch (err) {
             resolve({ code: null, timedOut: false, wasCancelled: false, tail: [String((err as Error).message)] });
             return;
           }
+          onProcess?.(proc, 'spawned');
           const feed = (chunk: Buffer) => {
             for (const l of chunk.toString('utf8').split(/\r?\n/)) {
               if (!l.trim()) continue;
@@ -161,11 +173,13 @@ export async function runValidation(
           proc.on('error', (err) => {
             clearTimeout(timer);
             signal?.removeEventListener('abort', onAbort);
+            onProcess?.(proc, 'closed');
             resolve({ code: null, timedOut: false, wasCancelled, tail: [err.message] });
           });
           proc.on('close', (code) => {
             clearTimeout(timer);
             signal?.removeEventListener('abort', onAbort);
+            onProcess?.(proc, 'closed');
             resolve({ code, timedOut, wasCancelled, tail });
           });
         },

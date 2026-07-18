@@ -356,6 +356,7 @@ export type AttemptState =
   | 'running'
   | 'validating'
   | 'cancelling'               // owner cancelled; termination not yet proven
+  | 'cancellation_failed'      // termination could NOT be proven; leases stay held
   | 'ready_for_review'
   | 'accepted'
   | 'rejected'
@@ -370,8 +371,11 @@ export const ACTIVE_ATTEMPT_STATES: AttemptState[] = [
   'running',
   'validating',
   // leases stay held while cancelling: they are only released once every
-  // child process is proven terminated (P0-3)
+  // tracked process is PROVEN terminated (P0-3)
   'cancelling',
+  // termination could not be proven — processes may still be running, so the
+  // task/worker/repo leases MUST stay held until the owner resolves it
+  'cancellation_failed',
 ];
 
 export type ExitReason =
@@ -499,6 +503,18 @@ export interface Attempt {
   checkpointCommit?: string | null;
   /** hash binding the completion approval to this exact evidence (P1) */
   evidenceHash?: string | null;
+  /**
+   * Result of the last termination attempt. `proven: false` means processes
+   * may still be running — the attempt is NOT settled as cancelled and its
+   * leases are NOT released.
+   */
+  terminationProof?: {
+    proven: boolean;
+    captured: number[];
+    livePids: number[];
+    detail: string;
+    at: string;
+  } | null;
 }
 
 export type OperationKind =

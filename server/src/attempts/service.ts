@@ -1,3 +1,4 @@
+import type { ChildProcess } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -35,7 +36,15 @@ import {
 } from '../git/git';
 import { ConflictError, type Store } from '../store/store';
 import { captureGitBaseline, findSymlinkEscapes, readGitLinkFile, verifyWorktreeIntegrity, type GitBaseline } from './integrity';
-import { CodexRunner, pidAlive, TestRunner, type RunnerHandle, type WorkerRunner } from './runners';
+import {
+  CodexRunner,
+  pidAlive,
+  terminateTree,
+  TestRunner,
+  type RunnerHandle,
+  type TerminationProof,
+  type WorkerRunner,
+} from './runners';
 import { runValidation } from './validator';
 
 /**
@@ -58,6 +67,11 @@ export class AttemptService {
   private aborts = new Map<string, AbortController>();
   /** in-flight process-tree termination per attempt; awaited before settling */
   private terminations = new Map<string, Promise<void>>();
+  /** live validation child processes per attempt (tracked for proven kills) */
+  private validationProcs = new Map<string, Set<ChildProcess>>();
+  /** in-flight finalizeCancellation per attempt (the pipeline and the cancel
+   * request can both reach it; they must not race) */
+  private finalizing = new Map<string, Promise<void>>();
 
   constructor(
     private readonly store: Store,
@@ -546,10 +560,36 @@ export class AttemptService {
     this.store.addEvent({ type: 'run.phase', taskId: attempt.taskId, message: label, data: { attemptId: attempt.id } });
   }
 
-  /** true once the owner requested cancellation for this attempt (P0-3) */
+  /**
+   * True once cancellation has been requested for this attempt (P0-3).
+   *
+   * Cancellation is now finalised concurrently with the pipeline, so the
+   * attempt may already have reached `cancelled` by the time a checkpoint is
+   * evaluated. Every cancellation-related state must stop the pipeline —
+   * otherwise it would race on and turn a cancelled attempt into a delivery.
+   */
   private cancelRequested(attemptId: string): boolean {
     if (this.aborts.get(attemptId)?.signal.aborted) return true;
-    return this.store.attempt(attemptId)?.state === 'cancelling';
+    const state = this.store.attempt(attemptId)?.state;
+    return state === 'cancelling' || state === 'cancellation_failed' || state === 'cancelled';
+  }
+
+  /** track live validation children so cancellation can prove they died */
+  private trackValidationProcess(attemptId: string, proc: ChildProcess, event: 'spawned' | 'closed'): void {
+    if (event === 'spawned') {
+      if (!this.validationProcs.has(attemptId)) this.validationProcs.set(attemptId, new Set());
+      this.validationProcs.get(attemptId)!.add(proc);
+      return;
+    }
+    this.validationProcs.get(attemptId)?.delete(proc);
+  }
+
+  /**
+   * Register (or replace) the runner for an adapter kind. Public so tests and
+   * future adapters can plug in without reaching into private state.
+   */
+  registerRunner(kind: string, runner: WorkerRunner): void {
+    this.runners.set(kind, runner);
   }
 
   /** fail-closed containment re-scan: reason string when an escape is found */
@@ -749,7 +789,11 @@ export class AttemptService {
       project.git!.validationCommands,
       worktreePath,
       (line, level) => this.log(this.store.attempt(attemptId)!, line, level),
-      { signal, beforeCommand: () => this.containmentGuard(worktreePath) },
+      {
+        signal,
+        beforeCommand: () => this.containmentGuard(worktreePath),
+        onProcess: (proc, event) => this.trackValidationProcess(attemptId, proc, event),
+      },
     );
     if (this.cancelRequested(attemptId)) {
       this.finishOp(valOp, 'failed', null, 'Cancelled by owner.');
@@ -943,6 +987,9 @@ export class AttemptService {
 
   private settleForReview(attemptId: string, validation: Attempt['validation'], evidence: AttemptEvidence, checkpointCommit: string | null): void {
     const attempt = this.store.attempt(attemptId)!;
+    // a cancelled/cancelling attempt must never be promoted to a delivery,
+    // even if the pipeline raced past a checkpoint
+    if (['cancelling', 'cancellation_failed', 'cancelled'].includes(attempt.state)) return;
     const task = this.mustTask(attempt.taskId);
     this.aborts.delete(attemptId);
     this.store.tx(() => {
@@ -980,9 +1027,12 @@ export class AttemptService {
       void this.finalizeCancellation(attemptId);
       return;
     }
-    if (['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
+    // an unproven cancellation must never be overwritten by a generic failure —
+    // its leases are held on purpose
+    if (['cancelled', 'failed', 'timeout', 'accepted', 'rejected', 'cancellation_failed'].includes(attempt.state)) return;
     this.live.delete(attemptId);
     this.aborts.delete(attemptId);
+    this.validationProcs.delete(attemptId);
     const task = this.store.task(attempt.taskId);
     this.store.tx(() => {
       attempt.state = exitReason === 'timeout' ? 'timeout' : 'failed';
@@ -1070,6 +1120,21 @@ export class AttemptService {
       return this.store.task(taskId)!; // already cancelling; nothing new to do
     }
 
+    // a previously FAILED cancellation can be retried: re-attempt termination
+    // and re-verify, without ever claiming success in between
+    if (attempt && attempt.state === 'cancellation_failed') {
+      this.store.tx(() => {
+        const a = this.store.attempt(attempt.id)!;
+        a.state = 'cancelling';
+        a.failureReason = 'Retrying cancellation — re-attempting termination of the tracked process tree.';
+        this.store.updateAttempt(a);
+      });
+      this.aborts.get(attempt.id)?.abort();
+      this.event('task.cancelling', `Retrying cancellation of attempt ${attempt.id}`, task.id, 'warning', { attemptId: attempt.id });
+      void this.finalizeCancellation(attempt.id);
+      return this.store.task(taskId)!;
+    }
+
     if (attempt && ['creating_worktree', 'running', 'validating'].includes(attempt.state)) {
       this.op(attempt.id, 'cancel_worker', `cancel:${attempt.id}`, null);
       this.store.tx(() => {
@@ -1092,11 +1157,16 @@ export class AttemptService {
             try {
               await handle.cancel();
             } catch {
-              /* termination is verified by pid check below */
+              /* termination is verified by the proof below */
             }
           })(),
         );
       }
+      // Drive finalization from here rather than relying on a pipeline
+      // checkpoint: a worker that refuses to die never resolves `done`, so the
+      // pipeline would stall and the attempt would sit in `cancelling` forever
+      // instead of honestly reporting a failed cancellation.
+      void this.finalizeCancellation(attempt.id);
       this.event('task.cancelling', `Owner cancelled “${task.title}” — terminating processes; leases stay held until termination is proven`, task.id, 'warning', { attemptId: attempt.id });
       return this.store.task(taskId)!;
     }
@@ -1110,58 +1180,141 @@ export class AttemptService {
   }
 
   /**
-   * Terminal step of cancellation: called ONLY from pipeline checkpoints (or
-   * recovery), i.e. after every spawned process has provably closed. Releases
-   * leases, frees the worker and settles the task.
+   * Terminate every tracked process for the attempt (worker tree + any live
+   * validation trees) and report a COMBINED proof. `proven` is true only when
+   * every captured pid of every tracked process is confirmed dead.
    */
-  private async finalizeCancellation(attemptId: string): Promise<void> {
+  private async proveAllTerminated(attemptId: string): Promise<TerminationProof> {
+    const captured = new Set<number>();
+    const live = new Set<number>();
+    const details: string[] = [];
+
+    const merge = (p: TerminationProof, label: string): void => {
+      for (const c of p.captured) captured.add(c);
+      for (const l of p.livePids) live.add(l);
+      if (!p.proven) details.push(`${label}: ${p.detail}`);
+    };
+
+    // worker tree
+    const handle = this.live.get(attemptId);
+    if (handle) {
+      try {
+        merge(await handle.cancel(), 'worker');
+      } catch (err) {
+        details.push(`worker: termination attempt threw (${(err as Error).message})`);
+        live.add(-1); // unknown state → cannot be proven
+      }
+    }
+
+    // any validation process trees still tracked for this attempt
+    for (const proc of this.validationProcs.get(attemptId) ?? []) {
+      try {
+        merge(await terminateTree(proc), `validation pid ${proc.pid ?? '?'}`);
+      } catch (err) {
+        details.push(`validation: termination attempt threw (${(err as Error).message})`);
+        live.add(-1);
+      }
+    }
+
+    // the attempt's recorded root pid must also be gone even if the handle was
+    // already dropped (e.g. after a phase transition)
     const attempt = this.store.attempt(attemptId);
-    if (!attempt || ['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
+    if (attempt?.pid != null) {
+      captured.add(attempt.pid);
+      if (pidAlive(attempt.pid)) {
+        live.add(attempt.pid);
+        details.push(`recorded worker pid ${attempt.pid} is still alive`);
+      }
+    }
+
+    const livePids = [...live].filter((p) => p > 0);
+    const proven = live.size === 0;
+    return {
+      proven,
+      captured: [...captured],
+      livePids,
+      detail: proven
+        ? `all ${captured.size} tracked process(es) confirmed dead`
+        : details.join('; ') || 'termination could not be confirmed',
+    };
+  }
+
+  /**
+   * Terminal step of cancellation. Settles CANCELLED and releases the
+   * task/worker/repo leases ONLY when every tracked process is confirmed dead.
+   * If termination cannot be proven within the limit the attempt moves to
+   * `cancellation_failed`, the leases STAY HELD (that state is an active
+   * state), and nothing claims the processes were terminated.
+   */
+  private finalizeCancellation(attemptId: string): Promise<void> {
+    const inFlight = this.finalizing.get(attemptId);
+    if (inFlight) return inFlight;
+    const run = this.finalizeCancellationInner(attemptId).finally(() => this.finalizing.delete(attemptId));
+    this.finalizing.set(attemptId, run);
+    return run;
+  }
+
+  private async finalizeCancellationInner(attemptId: string): Promise<void> {
+    const attempt = this.store.attempt(attemptId);
+    if (!attempt || ['cancelled', 'failed', 'timeout', 'accepted', 'rejected', 'cancellation_failed'].includes(attempt.state)) {
+      return;
+    }
 
     // ── PROVE termination BEFORE settling state or releasing any lease ──
     const pending = this.terminations.get(attemptId);
     if (pending) await pending;
-    const handle = this.live.get(attemptId);
-    if (handle) {
-      try {
-        await handle.cancel(); // idempotent; resolves once the tree is down
-      } catch {
-        /* verified by the pid check below */
-      }
-    }
-    // last-resort verification: the recorded root pid must be gone. A live pid
-    // means the tree survived — keep killing and waiting rather than lying.
-    if (attempt.pid != null) {
-      for (let i = 0; i < 40 && pidAlive(attempt.pid); i++) {
-        if (i % 8 === 0 && handle) {
-          try {
-            await handle.cancel();
-          } catch {
-            /* ignore */
-          }
-        }
-        await new Promise((r) => setTimeout(r, 250));
-      }
-      if (pidAlive(attempt.pid)) {
-        this.event(
-          'run.log',
-          `⚠ cancellation could not prove termination of pid ${attempt.pid} within 10s — settling as cancelled with an explicit warning`,
-          attempt.taskId,
-          'error',
-          { attemptId },
-        );
-      }
-    }
+    const proof = await this.proveAllTerminated(attemptId);
     this.terminations.delete(attemptId);
 
+    const task = this.store.task(attempt.taskId);
+    const proofRecord = { ...proof, at: nowIso() };
+
+    if (!proof.proven) {
+      // Cancellation FAILED: processes may still be running. Keep the leases,
+      // keep the worker busy, and say so plainly.
+      this.store.tx(() => {
+        const a = this.store.attempt(attemptId)!;
+        a.state = 'cancellation_failed';
+        a.exitReason = 'unknown';
+        a.terminationProof = proofRecord;
+        a.failureReason =
+          `Cancellation could NOT be confirmed: ${proof.detail}. ` +
+          'One or more processes may still be running, so the task/worker/repository leases remain held and the attempt is not marked cancelled. ' +
+          'Inspect the listed pids and terminate them, then retry cancellation.';
+        this.store.updateAttempt(a);
+        // NOTE: no releaseLeases(), no freeWorker() — deliberately.
+        const t = this.store.task(a.taskId);
+        if (t && !['completed', 'cancelled', 'failed'].includes(t.status)) {
+          t.phase = 'Cancellation failed — processes may still be running';
+          this.store.upsertTask(t);
+        }
+      });
+      const cancelOpFailed = this.store
+        .operationsForAttempt(attemptId)
+        .find((o) => o.kind === 'cancel_worker' && o.status === 'running');
+      if (cancelOpFailed) this.finishOp(cancelOpFailed, 'failed', null, proof.detail);
+      if (task) {
+        this.event(
+          'task.cancellation_failed',
+          `⚠ Cancellation of attempt ${attemptId} could NOT be confirmed — ${proof.detail}. Leases remain held; the task is NOT marked cancelled.`,
+          task.id,
+          'error',
+          { attemptId, livePids: proof.livePids },
+        );
+      }
+      return;
+    }
+
+    // proven dead → safe to settle and release
     this.live.delete(attemptId);
     this.aborts.delete(attemptId);
-    const task = this.store.task(attempt.taskId);
+    this.validationProcs.delete(attemptId);
     this.store.tx(() => {
       attempt.state = 'cancelled';
       attempt.exitReason = 'cancelled';
       attempt.endedAt = nowIso();
-      attempt.failureReason = 'Cancelled by owner. All worker/validation processes were terminated; the worktree is preserved.';
+      attempt.terminationProof = proofRecord;
+      attempt.failureReason = `Cancelled by owner. ${proof.detail}; the worktree is preserved.`;
       this.store.updateAttempt(attempt);
       this.store.releaseLeases(attemptId);
       this.freeWorker(attempt.workerId);
@@ -1172,8 +1325,16 @@ export class AttemptService {
       }
     });
     const cancelOp = this.store.operationsForAttempt(attemptId).find((o) => o.kind === 'cancel_worker' && o.status === 'running');
-    if (cancelOp) this.finishOp(cancelOp, 'succeeded');
-    if (task) this.event('task.cancelled', `Cancellation of attempt ${attemptId} complete — all processes terminated, leases released, worktree preserved`, task.id, 'warning', { attemptId });
+    if (cancelOp) this.finishOp(cancelOp, 'succeeded', 0, null);
+    if (task) {
+      this.event(
+        'task.cancelled',
+        `Cancellation of attempt ${attemptId} complete — ${proof.detail}; leases released, worktree preserved`,
+        task.id,
+        'warning',
+        { attemptId },
+      );
+    }
   }
 
   /** re-run ONLY validation (never the worker) in the preserved worktree */
@@ -1216,7 +1377,10 @@ export class AttemptService {
       project.git!.validationCommands,
       worktree,
       (line, level) => this.log(this.store.attempt(attemptId)!, line, level),
-      { beforeCommand: () => this.containmentGuard(worktree) },
+      {
+        beforeCommand: () => this.containmentGuard(worktree),
+        onProcess: (proc, event) => this.trackValidationProcess(attemptId, proc, event),
+      },
     );
     const postTree = await writeTreeSnapshot(worktree);
     const mutations = postTree === preTree ? [] : await diffTreePaths(worktree, preTree, postTree);
@@ -1271,6 +1435,12 @@ export class AttemptService {
     if (!attempt) throw new NotFound('Attempt not found.');
     if (['creating_worktree', 'running', 'validating', 'cancelling'].includes(attempt.state)) {
       throw new LifecycleError('Attempt is still active — cancel it first.');
+    }
+    if (attempt.state === 'cancellation_failed') {
+      throw new LifecycleError(
+        'Cancellation of this attempt was never confirmed — processes may still be writing to the worktree. ' +
+          'Terminate the recorded pids and retry cancellation before cleaning up.',
+      );
     }
     if (!attempt.worktreePath || attempt.worktreeCleanedAt) return attempt;
     const project = this.store.project(attempt.projectId);
@@ -1365,11 +1535,17 @@ export class AttemptService {
       } else if (attempt.state === 'validating') {
         attempt.state = 'blocked_reconciliation';
         attempt.failureReason = 'Validation was interrupted by a restart — re-run validation (the worker will not re-run).';
-      } else if (attempt.state === 'cancelling') {
-        attempt.state = 'cancelled';
-        attempt.exitReason = 'cancelled';
+      } else if (attempt.state === 'cancelling' || attempt.state === 'cancellation_failed') {
+        // A restart destroys the handles we would need to prove termination,
+        // and a recorded pid from the previous process lifetime may have been
+        // reused. We therefore do NOT claim the processes died: the attempt
+        // stays in cancellation_failed and KEEPS its leases.
+        attempt.state = 'cancellation_failed';
+        attempt.exitReason = 'unknown';
         attempt.failureReason =
-          'Cancellation was in progress when the Command Center restarted. Child-process termination could not be re-verified after the restart; the worktree is preserved for inspection.';
+          'Cancellation was in progress when the Command Center restarted, so child-process termination could NOT be re-verified. ' +
+          'Processes started by the previous run may still be alive: check the recorded pids, terminate anything still running, then retry cancellation. ' +
+          'The task/worker/repository leases remain held and the worktree is preserved.';
       } else {
         attempt.state = 'failed';
         attempt.exitReason = 'unknown';
@@ -1377,8 +1553,11 @@ export class AttemptService {
       }
       attempt.endedAt = nowIso();
       this.store.updateAttempt(attempt);
-      this.store.releaseLeases(attempt.id);
-      this.freeWorker(attempt.workerId);
+      // an unproven cancellation keeps its leases and its busy worker
+      if (attempt.state !== 'cancellation_failed') {
+        this.store.releaseLeases(attempt.id);
+        this.freeWorker(attempt.workerId);
+      }
       this.finishOp(op, 'succeeded');
 
       if (task && !['completed', 'cancelled'].includes(task.status)) {
