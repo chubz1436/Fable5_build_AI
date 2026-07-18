@@ -30,7 +30,7 @@ deps), vitest. Node ≥ 24, Windows. Owner: Chubz (Taglish is welcome).
   QUARANTINED (never instantiated — sample tasks always run the SimulatedAdapter; real execution only
   via AttemptService).
 - `client/src` — React SPA fed by an SSE store.
-- `server/test` — 85 tests (unit + full vertical-slice integration; deterministic test runner).
+- `server/test` — 98 tests (unit + full vertical-slice integration; deterministic test runner).
 
 ## Run it
 

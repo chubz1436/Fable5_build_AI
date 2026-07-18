@@ -132,7 +132,7 @@ gitignored: gitignored outputs are exempt from mutation detection by design.
 ## Testing
 
 ```bash
-npm test              # 85 tests: unit + API + full vertical-slice integration
+npm test              # 98 tests: unit + API + full vertical-slice integration
 npm run typecheck
 npm run build
 ```
@@ -147,8 +147,15 @@ mutations and secret-environment isolation, checkpoint recoverability after
 cleanup, cancellation in every pipeline phase (worktree creation, worker,
 validation) with proven process termination, transactional SSE (no phantom
 events on rollback), legacy-adapter quarantine, protected paths, secret
-redaction, and restart reconciliation. CI (GitHub Actions) runs on Ubuntu
-and Windows.
+redaction, and restart reconciliation. The hardening suite adds: git hook
+suppression (a blocking pre-commit hook cannot stop an app checkpoint),
+external-diff/textconv suppression, git-integrity tampering detection
+(worker-created commits, branch switches, ref/tag/local-config changes),
+symlink/junction escape scanning (fail-closed, external targets untouched),
+worker-env allowlisting (arbitrary parent secrets are never inherited),
+operation-status hygiene (no completed attempt leaves a running operation),
+and repository-attempt routing (only AttemptService-supported adapters).
+CI (GitHub Actions) runs on Ubuntu and Windows.
 
 ## Persistence & data
 
@@ -163,21 +170,41 @@ untouched. Back up by copying the `.db` file while the app is stopped.
   mutating requests; request-size limits; runtime schema validation (zod);
   no stack traces or secrets in responses; conservative security headers.
 - Git and worker processes are spawned with **argument arrays only** — no
-  `shell: true` anywhere in the execution path; validation commands are
-  argv-allowlisted at registration.
-- Validation subprocesses get a **minimal allowlisted environment** (PATH,
-  system dirs, temp, locale — nothing else, so API keys and tokens are
-  excluded by construction, not by blocklist); worker subprocess env strips
-  known secret variables; logs are secret-redacted before storage/display.
-- Attempts are confined to `data/worktrees/<attemptId>` (containment-checked;
-  symlinks/junctions inside the worktree that resolve outside it are detected
-  and fail validation); registered repos must be real git roots outside the
+  `shell: true` anywhere in the execution path (CLI version detection included;
+  it reuses the same hardened Windows-aware resolver + launcher as the attempt
+  pipeline); validation commands are argv-allowlisted at registration.
+- **Every** git invocation is hardened: repository hooks are disabled via a
+  controlled empty `core.hooksPath` (a hostile repo's pre-commit/post-checkout
+  hook can never execute through us), external diff drivers are disabled
+  (`diff.external=` + `--no-ext-diff --no-textconv`), fsmonitor is off, and the
+  git environment cannot prompt for credentials, open an editor/pager, or reach
+  the network (SSH/askpass disabled).
+- **Child-process environments are allowlists, never blocklists.** Validators
+  get PATH/system-dirs/temp/locale and nothing else. The Codex worker gets that
+  base plus exactly the keys a normal `codex login` needs (`CODEX_HOME`,
+  `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_ORG*`, `OPENAI_PROJECT`).
+  Arbitrary secrets in the app's own environment (including `AUTH_TOKEN` and
+  any `*_API_KEY`/`*_SECRET`) are excluded by construction. Logs are
+  secret-redacted before storage/display.
+- Attempts are confined to `data/worktrees/<attemptId>` (containment-checked).
+  A **fail-closed** symlink/junction/reparse-point scan runs before the worker
+  launches, before every validation command, before each checkpoint, and on
+  revalidation; any link resolving outside the worktree — or any scan error or
+  entry-limit hit — fails the attempt (external targets are read-only-resolved,
+  never written through). Registered repos must be real git roots outside the
   app's data directory; protected paths are enforced on the diff with
-  case-correct matching on Windows. `.git` integrity is verified explicitly
-  (gitdir link file, branch, worktree registration) — diff-based path checks
-  alone are NOT treated as protecting `.git`. The task's file *scope* field
-  is advisory only and is labeled as such on approvals (it is not enforced);
+  case-correct matching on Windows.
+- **Git integrity is snapshotted before the worker runs** (HEAD, branch,
+  gitdir link, all refs, tags, and local config) and re-verified afterwards and
+  before checkpoint: a worker-created commit, a branch switch, or any ref/tag/
+  local-config change blocks delivery, and HEAD must equal the approved base
+  commit before the app writes its checkpoint. `.git` protection is these
+  explicit checks — never diff-based path filtering alone. The task's file
+  *scope* field is advisory only and is labeled as such on approvals;
   *protected paths* are enforced.
+- Repository attempts may run **only on adapters AttemptService can drive**
+  (Codex, or the deterministic test runner); any other adapter is refused at
+  request-start and never reaches execution.
 - No merge, no push, no LAN exposure, no telemetry.
 
 ## Known limitations

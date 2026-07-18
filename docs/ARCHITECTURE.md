@@ -254,8 +254,10 @@ mutation to SSE subscribers.
 | Durable checkpoint commits + loss-refusing cleanup                       |                                                    |
 | Authoritative cancellation (CANCELLING; proven termination)              |                                                    |
 | Crash reconciliation (`unknown_outcome`, re-validate without re-run)     |                                                    |
+| Hardened git (hooks/ext-diff off) + baseline tamper detection            |                                                    |
+| Allowlisted worker/validator env; fail-closed symlink escape scan        |                                                    |
 | Local security boundary (loopback + token + origin + zod)                |                                                    |
-| Transactional SSE live updates; full REST API + 85 tests                 |                                                    |
+| Transactional SSE live updates; full REST API + 98 tests                 |                                                    |
 
 ## Repository-backed execution (v0.3)
 
@@ -275,11 +277,15 @@ Projects registry ──► Task (gitProjectId) ──► exact approval grant
 ```
 
 Key modules: `db/db.ts` (SQLite WAL + migrations + legacy import),
-`git/git.ts` (execFile-only plumbing), `git/projects.ts` (registry +
-sanitizers), `attempts/service.ts` (grants, leases, pipeline, recovery,
-cleanup), `attempts/runners.ts` (TestRunner + hardened CodexRunner +
-redaction + safe spawning), `attempts/validator.ts` (independent checks),
-`attempts/integrity.ts` (git/worktree integrity + symlink-escape scan),
+`git/git.ts` (execFile-only plumbing; EVERY call forces an empty `core.hooksPath`,
+`diff.external=`, `--no-ext-diff --no-textconv`, no-fsmonitor, and a
+non-interactive/no-network git env), `git/projects.ts` (registry + sanitizers),
+`attempts/service.ts` (grants, leases, pipeline, recovery, cleanup, routing),
+`attempts/runners.ts` (TestRunner + hardened CodexRunner + redaction + safe
+spawning), `attempts/env.ts` (allowlisted child environments — validator and
+worker), `attempts/validator.ts` (independent checks + fail-closed per-command
+containment guard), `attempts/integrity.ts` (pre-execution git baseline +
+tamper verification + fail-closed symlink/junction escape scan),
 `security/auth.ts` (token + origin + headers). Attempt states:
 `creating_worktree → running → validating → ready_for_review →
 accepted|rejected`, plus `cancelling | cancelled | failed | timeout |
