@@ -314,6 +314,12 @@ export interface SystemStatus {
   engine: string;
   simSpeed: number;
   dataFile: string;
+  /**
+   * Workers AttemptService can actually drive for repository-backed attempts.
+   * The UI must not offer any other worker for a git task — request-start
+   * refuses them.
+   */
+  repoCapableWorkerIds: string[];
 }
 
 /** Result of parsing a natural-language request into a draft task. */
@@ -421,6 +427,12 @@ export interface ExecutionSpec {
   validationCommands: Array<{ name: string; argv: string[]; required: boolean; timeoutMs: number }>;
   /** worker sandbox mode, e.g. 'workspace-write' (codex) or 'none' (test runner) */
   sandbox: string;
+  /**
+   * How the worker authenticates: 'login_file' (on-disk `codex login`, no API
+   * key forwarded) or 'api_key' (explicit owner opt-in). Part of the approved
+   * spec — switching modes requires a new approval.
+   */
+  credentialMode: string;
   networkAccess: boolean;
   dependencyInstallAllowed: boolean;
   workerTimeoutMs: number;

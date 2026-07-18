@@ -26,6 +26,7 @@ import {
   diffTreePaths,
   diffUnified,
   headCommit,
+  resetFilterDriverCache,
   revParse,
   stageAll,
   statusPorcelain,
@@ -34,7 +35,7 @@ import {
 } from '../git/git';
 import { ConflictError, type Store } from '../store/store';
 import { captureGitBaseline, findSymlinkEscapes, readGitLinkFile, verifyWorktreeIntegrity, type GitBaseline } from './integrity';
-import { CodexRunner, TestRunner, type RunnerHandle, type WorkerRunner } from './runners';
+import { CodexRunner, pidAlive, TestRunner, type RunnerHandle, type WorkerRunner } from './runners';
 import { runValidation } from './validator';
 
 /**
@@ -55,13 +56,18 @@ export class AttemptService {
   private live = new Map<string, RunnerHandle>(); // attemptId → handle
   /** one cancellation context per attempt, spanning every pipeline phase (P0-3) */
   private aborts = new Map<string, AbortController>();
+  /** in-flight process-tree termination per attempt; awaited before settling */
+  private terminations = new Map<string, Promise<void>>();
 
   constructor(
     private readonly store: Store,
     private readonly config: AppConfig,
   ) {
     this.runners.set('test', new TestRunner());
-    this.runners.set('codex', new CodexRunner({ command: config.codexCommand, model: config.codexModel }));
+    this.runners.set(
+      'codex',
+      new CodexRunner({ command: config.codexCommand, model: config.codexModel, authMode: config.codexAuthMode }),
+    );
   }
 
   // -- helpers ---------------------------------------------------------------
@@ -144,6 +150,7 @@ export class AttemptService {
         timeoutMs: c.timeoutMs,
       })),
       sandbox: runner.adapter === 'codex' ? 'workspace-write' : 'none',
+      credentialMode: runner.adapter === 'codex' ? this.config.codexAuthMode : 'none',
       networkAccess: false,
       dependencyInstallAllowed: false,
       workerTimeoutMs: this.config.attemptTimeoutMs,
@@ -600,6 +607,10 @@ export class AttemptService {
       return this.failAttempt(attemptId, 'failure', `Could not capture git baseline: ${(err as Error).message}`);
     }
 
+    // re-enumerate content-filter drivers before the worker phase, so the
+    // neutralising overrides cover anything configured since registration
+    resetFilterDriverCache();
+
     // fail-closed containment scan BEFORE the worker is ever launched
     const preLaunchEscapes = findSymlinkEscapes(worktreePath);
     if (preLaunchEscapes.length > 0) {
@@ -698,7 +709,10 @@ export class AttemptService {
     }
     if (this.cancelRequested(attemptId)) return this.finalizeCancellation(attemptId);
 
-    // 4) pre-validation snapshot + diff capture (P0-1)
+    // 4) pre-validation snapshot + diff capture (P0-1). The worker has just
+    // run, so re-enumerate filter drivers before any staging/diff touches
+    // worker-authored content.
+    resetFilterDriverCache();
     this.phase(attempt, 'Capturing git diff', 85);
     const diffOp = this.op(attemptId, 'capture_diff', `diff:${attemptId}`, JSON.stringify(['git', 'add', '-A', '&&', 'git', 'diff', attempt.baseCommit]));
     let evidence: AttemptEvidence;
@@ -778,6 +792,7 @@ export class AttemptService {
     // must be lossless BEFORE it becomes reviewable. Require HEAD == approved
     // base commit right before checkpointing (git-integrity hardening) and a
     // clean containment scan, so we never checkpoint tampered git state.
+    resetFilterDriverCache(); // fresh enumeration before the checkpoint commit
     const preCkHead = await headCommit(worktreePath);
     if (preCkHead !== attempt.baseCommit) {
       return this.failAttempt(attemptId, 'failure', `Refusing to checkpoint — worktree HEAD ${preCkHead?.slice(0, 10) ?? 'unknown'} is not the approved base commit ${attempt.baseCommit.slice(0, 10)} (a commit was created during the attempt).`, outcome.logTail);
@@ -961,7 +976,10 @@ export class AttemptService {
   private failAttempt(attemptId: string, exitReason: Attempt['exitReason'], reason: string, logTail: string[] = []): void {
     const attempt = this.store.attempt(attemptId);
     if (!attempt) return;
-    if (attempt.state === 'cancelling') return this.finalizeCancellation(attemptId);
+    if (attempt.state === 'cancelling') {
+      void this.finalizeCancellation(attemptId);
+      return;
+    }
     if (['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
     this.live.delete(attemptId);
     this.aborts.delete(attemptId);
@@ -1065,7 +1083,20 @@ export class AttemptService {
       });
       // fire the shared cancellation context; every pipeline phase checks it
       this.aborts.get(attempt.id)?.abort();
-      handle?.cancel();
+      // track the tree-termination so finalizeCancellation can AWAIT it —
+      // nothing settles until the whole process tree is proven dead
+      if (handle) {
+        this.terminations.set(
+          attempt.id,
+          (async () => {
+            try {
+              await handle.cancel();
+            } catch {
+              /* termination is verified by pid check below */
+            }
+          })(),
+        );
+      }
       this.event('task.cancelling', `Owner cancelled “${task.title}” — terminating processes; leases stay held until termination is proven`, task.id, 'warning', { attemptId: attempt.id });
       return this.store.task(taskId)!;
     }
@@ -1083,9 +1114,46 @@ export class AttemptService {
    * recovery), i.e. after every spawned process has provably closed. Releases
    * leases, frees the worker and settles the task.
    */
-  private finalizeCancellation(attemptId: string): void {
+  private async finalizeCancellation(attemptId: string): Promise<void> {
     const attempt = this.store.attempt(attemptId);
     if (!attempt || ['cancelled', 'failed', 'timeout', 'accepted', 'rejected'].includes(attempt.state)) return;
+
+    // ── PROVE termination BEFORE settling state or releasing any lease ──
+    const pending = this.terminations.get(attemptId);
+    if (pending) await pending;
+    const handle = this.live.get(attemptId);
+    if (handle) {
+      try {
+        await handle.cancel(); // idempotent; resolves once the tree is down
+      } catch {
+        /* verified by the pid check below */
+      }
+    }
+    // last-resort verification: the recorded root pid must be gone. A live pid
+    // means the tree survived — keep killing and waiting rather than lying.
+    if (attempt.pid != null) {
+      for (let i = 0; i < 40 && pidAlive(attempt.pid); i++) {
+        if (i % 8 === 0 && handle) {
+          try {
+            await handle.cancel();
+          } catch {
+            /* ignore */
+          }
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      if (pidAlive(attempt.pid)) {
+        this.event(
+          'run.log',
+          `⚠ cancellation could not prove termination of pid ${attempt.pid} within 10s — settling as cancelled with an explicit warning`,
+          attempt.taskId,
+          'error',
+          { attemptId },
+        );
+      }
+    }
+    this.terminations.delete(attemptId);
+
     this.live.delete(attemptId);
     this.aborts.delete(attemptId);
     const task = this.store.task(attempt.taskId);
@@ -1133,7 +1201,9 @@ export class AttemptService {
       }
     });
 
-    // fail-closed containment scan before re-validating
+    // fresh filter-driver enumeration + fail-closed containment scan before
+    // re-validating a preserved worktree
+    resetFilterDriverCache();
     const revalEscapes = findSymlinkEscapes(worktree);
     if (revalEscapes.length > 0) {
       throw new LifecycleError(`Refusing to re-validate — symlink/junction escape detected: ${revalEscapes.slice(0, 8).join(', ')}`);

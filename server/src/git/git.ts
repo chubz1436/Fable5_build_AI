@@ -1,21 +1,33 @@
 import { execFile } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { allowlistedChildEnv } from '../attempts/env';
 
 /**
  * Safe git plumbing. Every call is `execFile('git', [...args])` — argument
  * arrays only, no shell, no string composition. Callers pass canonical
  * repository paths that were validated at registration time.
  *
- * Hardening (applied to EVERY invocation):
- *  - `core.hooksPath` is pointed at a controlled EMPTY directory, so no
- *    repository hook (pre-commit, post-checkout, …) can ever execute while the
- *    Command Center drives git — a hostile repo cannot run code through us.
- *  - `diff.external` is cleared, so no external diff driver runs.
- *  - `core.fsmonitor` is disabled (no long-running fsmonitor child).
- *  - the environment cannot prompt for credentials or reach the network.
- * These `-c` overrides win over repo/global/system config.
+ * Hardening applied to EVERY invocation — a hostile repository must not be
+ * able to execute code through us during checkout, staging, snapshotting,
+ * diffing, or checkpointing:
+ *  - `core.hooksPath` points at a PRIVATE, RANDOMIZED, NON-EXISTENT path that
+ *    is re-verified immediately before each call (rotated if anything creates
+ *    it), so no repository hook can ever run;
+ *  - every configured content filter driver (`filter.<n>.clean/.smudge/
+ *    .process`) is enumerated and neutralised, and `.required` forced false,
+ *    so clean/smudge/process filters never execute (`.gitattributes` alone
+ *    cannot invoke anything when no driver command is defined);
+ *  - `core.attributesFile` is cleared and `GIT_ATTR_NOSYSTEM=1` set, removing
+ *    the out-of-tree attribute sources;
+ *  - `diff.external` is cleared and diff subcommands add
+ *    `--no-ext-diff --no-textconv`;
+ *  - `core.fsmonitor` is disabled (no long-running fsmonitor child);
+ *  - the environment is a MINIMAL ALLOWLIST (not process.env) and cannot
+ *    prompt for credentials, open an editor/pager, or reach the network.
+ * These `-c` overrides win over repo, global and system config.
  */
 
 export interface GitResult {
@@ -31,28 +43,85 @@ export class GitError extends Error {
   }
 }
 
-let cachedHooksDir: string | null = null;
+let hooksPathCache: string | null = null;
 
-/** a controlled, empty hooks directory reused for every git invocation */
-export function emptyHooksPath(): string {
-  if (cachedHooksDir && fs.existsSync(cachedHooksDir)) return cachedHooksDir;
-  const dir = path.join(os.tmpdir(), 'chubz-cc-empty-hooks');
-  fs.mkdirSync(dir, { recursive: true });
-  // guard: if anything ever dropped a hook here, refuse to trust it silently
-  for (const entry of fs.readdirSync(dir)) {
-    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
-  }
-  cachedHooksDir = dir;
-  return dir;
+/**
+ * A private, randomized hooks path that is deliberately NEVER created. Git
+ * finds no hooks there, and because the name is unguessable a worker cannot
+ * pre-populate it. Verified immediately before every git call: if anything
+ * ever brings it into existence, we rotate to a fresh random name rather than
+ * trusting it (hooks-directory tampering defence).
+ */
+export function privateHooksPath(): string {
+  if (hooksPathCache && !fs.existsSync(hooksPathCache)) return hooksPathCache;
+  hooksPathCache = path.join(os.tmpdir(), `chubz-cc-nohooks-${crypto.randomBytes(16).toString('hex')}`);
+  return hooksPathCache;
 }
 
-/** config overrides forced onto every git call (hooks/ext-diff/fsmonitor off) */
-function hardeningArgs(): string[] {
+/** base overrides that never need repository introspection */
+function baseHardeningArgs(): string[] {
   return [
-    '-c', `core.hooksPath=${emptyHooksPath()}`,
+    '-c', `core.hooksPath=${privateHooksPath()}`,
     '-c', 'diff.external=',
     '-c', 'core.fsmonitor=false',
+    '-c', 'core.attributesFile=',
   ];
+}
+
+/**
+ * Discovering WHICH filter drivers exist costs a `git config` call, so the
+ * driver-name list is cached per working directory. The neutralising `-c`
+ * overrides are still applied to EVERY git invocation — only the name
+ * discovery is cached, and the pipeline calls resetFilterDriverCache() at each
+ * consequential phase boundary (before worker launch, validation, snapshots
+ * and checkpoint) so the enumeration is always fresh where it matters.
+ * Introducing a new driver additionally requires a git-config change, which the
+ * integrity baseline independently detects and blocks (config_changed).
+ */
+const DRIVER_CACHE_TTL_MS = 60_000;
+const driverCache = new Map<string, { names: string[]; at: number }>();
+
+/** discard cached driver names (call at attempt phase boundaries / in tests) */
+export function resetFilterDriverCache(): void {
+  driverCache.clear();
+}
+
+async function filterDriverNames(cwd: string | undefined): Promise<string[]> {
+  if (!cwd) return [];
+  const cached = driverCache.get(cwd);
+  if (cached && Date.now() - cached.at < DRIVER_CACHE_TTL_MS) return cached.names;
+  const names: string[] = [];
+  const listed = await rawGit(['config', '--get-regexp', '^filter\\.'], cwd);
+  if (listed.code === 0) {
+    for (const line of listed.stdout.split('\n')) {
+      const m = line.trim().match(/^filter\.(.+)\.(?:clean|smudge|process|required)\s/);
+      if (m?.[1] && !names.includes(m[1])) names.push(m[1]);
+    }
+  }
+  driverCache.set(cwd, { names, at: Date.now() });
+  return names;
+}
+
+/**
+ * Neutralise every content-filter driver visible to this repository (system +
+ * global + local). A filter only runs when its command is configured, so
+ * clearing `clean`, `smudge` and `process` — and forcing `required=false` so a
+ * required filter cannot fail the operation instead — makes filter execution
+ * impossible regardless of what `.gitattributes` requests.
+ */
+async function filterNeutralizingArgs(cwd: string | undefined): Promise<string[]> {
+  const names = new Set<string>(['lfs']); // always neutralise the common driver
+  for (const n of await filterDriverNames(cwd)) names.add(n);
+  const args: string[] = [];
+  for (const n of names) {
+    args.push(
+      '-c', `filter.${n}.clean=`,
+      '-c', `filter.${n}.smudge=`,
+      '-c', `filter.${n}.process=`,
+      '-c', `filter.${n}.required=false`,
+    );
+  }
+  return args;
 }
 
 /** subcommands that accept diff-content flags: also block textconv/ext-diff */
@@ -62,29 +131,55 @@ function noExtDiffArgs(args: string[]): string[] {
   return DIFF_SUBCOMMANDS.has(args[0] ?? '') ? ['--no-ext-diff', '--no-textconv'] : [];
 }
 
-const HARDENED_ENV: NodeJS.ProcessEnv = {
-  ...process.env,
-  GIT_TERMINAL_PROMPT: '0',
-  GIT_OPTIONAL_LOCKS: '0',
-  // never let git invoke an editor/pager or an askpass helper
-  GIT_PAGER: 'cat',
-  GIT_ASKPASS: '',
-  GIT_SSH_COMMAND: 'false',
-};
+/**
+ * Minimal allowlisted environment for git subprocesses — never process.env, so
+ * an injected secret cannot be read by anything git might spawn.
+ */
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...allowlistedChildEnv(),
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_OPTIONAL_LOCKS: '0',
+    GIT_ATTR_NOSYSTEM: '1',
+    // never let git invoke an editor/pager or an askpass helper
+    GIT_PAGER: 'cat',
+    GIT_ASKPASS: '',
+    GIT_SSH_COMMAND: 'false',
+  };
+}
 
-export function runGit(args: string[], cwd?: string, timeoutMs = 30_000): Promise<GitResult> {
-  const full = [...hardeningArgs(), args[0]!, ...noExtDiffArgs(args), ...args.slice(1)];
+function execGit(full: string[], cwd: string | undefined, timeoutMs: number): Promise<GitResult> {
   return new Promise((resolve) => {
     execFile(
       'git',
       full,
-      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: HARDENED_ENV },
+      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true, env: gitEnv() },
       (err, stdout, stderr) => {
         const raw: unknown = err ? (err as NodeJS.ErrnoException & { code?: unknown }).code : 0;
         resolve({ code: typeof raw === 'number' ? raw : err ? 1 : 0, stdout: stdout ?? '', stderr: stderr ?? '' });
       },
     );
   });
+}
+
+/**
+ * Hardened git WITHOUT filter enumeration — used only for the config read that
+ * discovers filter drivers (reading config never runs a filter), so there is
+ * no recursion.
+ */
+function rawGit(args: string[], cwd?: string, timeoutMs = 30_000): Promise<GitResult> {
+  return execGit([...baseHardeningArgs(), ...args], cwd, timeoutMs);
+}
+
+export async function runGit(args: string[], cwd?: string, timeoutMs = 30_000): Promise<GitResult> {
+  const full = [
+    ...baseHardeningArgs(),
+    ...(await filterNeutralizingArgs(cwd)),
+    args[0]!,
+    ...noExtDiffArgs(args),
+    ...args.slice(1),
+  ];
+  return execGit(full, cwd, timeoutMs);
 }
 
 async function mustGit(args: string[], cwd: string, what: string): Promise<string> {

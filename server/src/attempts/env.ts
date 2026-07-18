@@ -30,18 +30,34 @@ const BASE_ENV_ALLOWLIST = [
 const ENV_ALLOWLIST = new Set(BASE_ENV_ALLOWLIST.map((k) => k.toUpperCase()));
 
 /**
- * Extra keys the real Codex worker needs so a normal `codex login` (ChatGPT
- * token stored under CODEX_HOME, or an API key) keeps working. Nothing here is
- * a Command Center secret; everything else in the parent env is dropped.
+ * Codex credential modes.
+ *
+ *  - 'login_file' (DEFAULT): authentication comes from the on-disk login the
+ *    owner created with `codex login` (under CODEX_HOME, default ~/.codex).
+ *    NO API-key environment variable is passed to the worker — a key sitting
+ *    in the Command Center's environment is never silently handed to a model
+ *    subprocess.
+ *  - 'api_key': explicit owner opt-in (CODEX_AUTH_MODE=api_key). Only then are
+ *    OPENAI_API_KEY and the related endpoint/org variables forwarded.
  */
-export const CODEX_ENV_EXTRA = [
-  'CODEX_HOME',
+export type CodexAuthMode = 'login_file' | 'api_key';
+
+/** location of the on-disk codex login; safe (and required) in both modes */
+export const CODEX_LOGIN_ENV = ['CODEX_HOME'];
+
+/** forwarded ONLY when the owner opts into API-key authentication */
+export const CODEX_API_KEY_ENV = [
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'OPENAI_ORG_ID',
   'OPENAI_ORGANIZATION',
   'OPENAI_PROJECT',
 ];
+
+/** env keys the Codex worker may inherit for the selected credential mode */
+export function codexEnvExtra(mode: CodexAuthMode): string[] {
+  return mode === 'api_key' ? [...CODEX_LOGIN_ENV, ...CODEX_API_KEY_ENV] : [...CODEX_LOGIN_ENV];
+}
 
 /** build a child environment from the base allowlist plus `extra` keys */
 export function allowlistedChildEnv(extra: string[] = [], base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

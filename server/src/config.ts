@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { CodexAuthMode } from './attempts/env';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 /** repo root = server/src/../.. */
@@ -42,6 +43,13 @@ export interface AppConfig {
   codexTimeoutMs: number;
   /** optional Codex model override; empty = respect the user's codex config */
   codexModel: string;
+  /**
+   * Codex credential mode. 'login_file' (default) authenticates from the
+   * on-disk `codex login` under CODEX_HOME and never forwards an API key.
+   * 'api_key' is an explicit owner opt-in (CODEX_AUTH_MODE=api_key) that
+   * additionally passes OPENAI_API_KEY and related variables to the worker.
+   */
+  codexAuthMode: CodexAuthMode;
   /** command used to launch the Antigravity CLI (tests substitute a fake) */
   antigravityCommand: string;
   antigravityTimeoutMs: number;
@@ -94,6 +102,8 @@ export function loadConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     codexCommand: process.env.CODEX_CLI ?? 'codex',
     codexTimeoutMs: Number(process.env.CODEX_TIMEOUT_MS ?? 600_000),
     codexModel: process.env.CODEX_MODEL ?? '',
+    // API-key env authentication is OPT-IN; the default uses the on-disk login
+    codexAuthMode: process.env.CODEX_AUTH_MODE === 'api_key' ? 'api_key' : 'login_file',
     antigravityCommand: process.env.ANTIGRAVITY_CLI ?? 'agy',
     antigravityTimeoutMs: Number(process.env.ANTIGRAVITY_TIMEOUT_MS ?? 600_000),
     antigravityModel: process.env.ANTIGRAVITY_MODEL ?? '',

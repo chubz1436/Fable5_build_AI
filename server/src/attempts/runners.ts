@@ -2,7 +2,7 @@ import { spawn, execFile, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { EventLevel, ExitReason } from '../../../shared/types';
-import { allowlistedChildEnv, CODEX_ENV_EXTRA } from './env';
+import { allowlistedChildEnv, codexEnvExtra, type CodexAuthMode } from './env';
 
 /**
  * Hardened worker runners for repository-backed attempts (P0.8).
@@ -122,10 +122,14 @@ export async function resolveExecutable(command: string): Promise<ResolvedExecut
 export function spawnSafe(
   resolved: ResolvedExecutable,
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: ['pipe' | 'ignore', 'pipe', 'pipe'] },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdio: ['pipe' | 'ignore', 'pipe', 'pipe']; detached?: boolean },
 ): ChildProcess {
+  // On POSIX, long-running children are spawned in their own process group so
+  // cancellation can signal the WHOLE group (detached/background descendants
+  // included) rather than just the direct child.
+  const detached = opts.detached === true && !WIN;
   if (!resolved.viaCmdShim) {
-    return spawn(resolved.file, args, { ...opts, windowsHide: true, shell: false });
+    return spawn(resolved.file, args, { ...opts, detached, windowsHide: true, shell: false });
   }
   for (const a of args) {
     if (!SAFE_SHIM_ARG.test(a)) {
@@ -141,22 +145,76 @@ export function spawnSafe(
   const line = `"${resolved.file}" ${args.join(' ')}`.trim();
   return spawn('cmd.exe', ['/d', '/c', line], {
     ...opts,
+    // MUST use the computed value: a raw `detached: true` here would put
+    // cmd.exe in its own console/process group on Windows and break the piped
+    // stdin the worker reads its brief from.
+    detached,
     windowsHide: true,
     shell: false,
     windowsVerbatimArguments: true,
   });
 }
 
-export function killProcessTree(proc: ChildProcess): void {
-  if (proc.pid == null) return;
+/**
+ * Terminate the ENTIRE process tree and resolve only once termination is
+ * PROVEN (cancellation must be authoritative).
+ *
+ * Windows: `taskkill /T /F` walks the descendant tree and kills it in one
+ * shot. We never kill the cmd.exe wrapper first — doing so orphans the real
+ * worker and its children, which then survive the "cancellation". We await
+ * taskkill's exit, then confirm the root pid is gone.
+ *
+ * POSIX: workers are spawned detached (own process group), so a negative pid
+ * signals the whole group — background/detached descendants included.
+ */
+export function killProcessTree(proc: ChildProcess): Promise<void> {
+  const pid = proc.pid;
+  if (pid == null) return Promise.resolve();
   if (WIN) {
-    spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true });
-  } else {
-    try {
-      proc.kill('SIGKILL');
-    } catch {
-      /* already gone */
-    }
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      try {
+        const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+        killer.on('error', done);
+        killer.on('close', done);
+      } catch {
+        done();
+      }
+      // never hang cancellation on a wedged taskkill
+      setTimeout(done, 10_000).unref?.();
+    });
+  }
+  return new Promise<void>((resolve) => {
+    const signalGroup = (sig: NodeJS.Signals) => {
+      try {
+        process.kill(-pid, sig); // negative pid → the whole process group
+      } catch {
+        try {
+          proc.kill(sig);
+        } catch {
+          /* already gone */
+        }
+      }
+    };
+    signalGroup('SIGKILL');
+    resolve();
+  });
+}
+
+/** true when the pid is no longer alive */
+export function pidAlive(pid: number | null | undefined): boolean {
+  if (pid == null) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -186,7 +244,8 @@ export interface RunnerHandle {
   executablePath: string | null;
   version: string | null;
   done: Promise<RunnerOutcome>;
-  cancel(): void;
+  /** resolves only once the whole process tree is proven terminated */
+  cancel(): Promise<void>;
 }
 
 export interface WorkerRunner {
@@ -201,7 +260,7 @@ function runSession(
   proc: ChildProcess,
   launch: RunnerLaunch,
   classifyExit: (code: number | null, text: string, flags: { cancelled: boolean; timedOut: boolean }) => ExitReason,
-): { done: Promise<RunnerOutcome>; cancel(): void } {
+): { done: Promise<RunnerOutcome>; cancel(): Promise<void> } {
   const tail: string[] = [];
   let lineCount = 0;
   let cancelled = false;
@@ -263,15 +322,19 @@ function runSession(
 
   return {
     done,
-    cancel() {
+    /**
+     * Authoritative cancellation: kill the WHOLE tree immediately (never the
+     * cmd.exe wrapper first, never a delayed taskkill — that orphans the real
+     * worker and its background children), then wait for the process to close
+     * so the caller can prove termination before settling state.
+     */
+    async cancel(): Promise<void> {
       cancelled = true;
-      // graceful first, then the whole tree
-      try {
-        proc.kill();
-      } catch {
-        /* ignore */
-      }
-      setTimeout(() => killProcessTree(proc), 2000).unref?.();
+      await killProcessTree(proc);
+      await Promise.race([
+        done.then(() => undefined),
+        new Promise<void>((r) => setTimeout(r, 15_000).unref?.()),
+      ]);
     },
   };
 }
@@ -324,6 +387,8 @@ export class TestRunner implements WorkerRunner {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
       shell: false,
+      // own process group on POSIX → cancellation kills background descendants
+      detached: process.platform !== 'win32',
     });
     const session = runSession(proc, launch, (code) => (code === 0 ? 'success' : 'failure'));
     return {
@@ -356,8 +421,13 @@ export class CodexRunner implements WorkerRunner {
   readonly adapter = 'codex';
 
   constructor(
-    private readonly options: { command: string; model: string },
+    private readonly options: { command: string; model: string; authMode?: CodexAuthMode },
   ) {}
+
+  /** credential mode this runner will use (default: on-disk codex login) */
+  get authMode(): CodexAuthMode {
+    return this.options.authMode ?? 'login_file';
+  }
 
   async probe() {
     const resolved = await resolveExecutable(this.options.command);
@@ -366,7 +436,7 @@ export class CodexRunner implements WorkerRunner {
       try {
         const proc = spawnSafe(resolved, ['--version'], {
           cwd: process.cwd(),
-          env: allowlistedChildEnv(CODEX_ENV_EXTRA),
+          env: allowlistedChildEnv(codexEnvExtra(this.authMode)),
           stdio: ['ignore', 'pipe', 'pipe'],
         });
         let out = '';
@@ -389,7 +459,7 @@ export class CodexRunner implements WorkerRunner {
         pid: null,
         executablePath: null,
         version: null,
-        cancel() {},
+        async cancel() {},
         done: Promise.resolve({
           exitReason: 'unavailable',
           exitCode: null,
@@ -413,17 +483,20 @@ export class CodexRunner implements WorkerRunner {
       '-',
     ];
     // Minimal ALLOWLISTED environment (never a blocklist): the base benign
-    // variables plus exactly the keys Codex needs to find its login and run.
-    // Arbitrary secrets in the parent process are excluded by construction.
-    //   - CODEX_HOME / OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_ORG* keep the
-    //     normal `codex login` (ChatGPT token or API key) flow working;
-    //   - CLAUDECODE / CLAUDE_CODE_ENTRYPOINT / AUTH_TOKEN are never inherited.
-    const env = allowlistedChildEnv(CODEX_ENV_EXTRA, launch.env ?? process.env);
+    // variables plus exactly the keys the SELECTED credential mode needs.
+    //   - default 'login_file': only CODEX_HOME — authentication comes from the
+    //     on-disk `codex login`; an OPENAI_API_KEY present in the Command
+    //     Center's environment is NOT forwarded;
+    //   - 'api_key' (explicit owner opt-in): additionally OPENAI_API_KEY and
+    //     the related endpoint/org variables;
+    //   - AUTH_TOKEN and every other parent secret are never inherited.
+    const env = allowlistedChildEnv(codexEnvExtra(this.authMode), launch.env ?? process.env);
 
     const proc = spawnSafe(resolved, args, {
       cwd: launch.worktree,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true, // own process group on POSIX → whole-group cancellation
     });
     proc.stdin?.write(launch.brief);
     proc.stdin?.end();
