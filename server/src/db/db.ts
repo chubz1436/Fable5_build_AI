@@ -16,7 +16,7 @@ import { DatabaseSync } from 'node:sqlite';
  *  - WAL mode gives crash-safe writes; each statement is durable.
  */
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -80,11 +80,11 @@ CREATE TABLE IF NOT EXISTS attempts (
   started_at     TEXT NOT NULL,
   json           TEXT NOT NULL
 );
--- hard guarantee: one active attempt per task. 'cancelling' and
--- 'cancellation_failed' still count as active: their processes may be alive,
--- so they keep holding their leases.
+-- hard guarantee: one active attempt per task. 'cancelling',
+-- 'cancellation_failed' and 'termination_failed' still count as active:
+-- their processes may be alive, so they keep holding their leases.
 CREATE UNIQUE INDEX IF NOT EXISTS attempts_one_active ON attempts(task_id)
-  WHERE state IN ('creating_worktree','running','validating','cancelling','cancellation_failed');
+  WHERE state IN ('creating_worktree','running','validating','cancelling','cancellation_failed','termination_failed');
 CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
 
 CREATE TABLE IF NOT EXISTS operations (
@@ -156,14 +156,15 @@ export class Db {
       );
     }
     if (current < SCHEMA_VERSION) {
-      if (current < 3) {
-        // v2 added 'cancelling'; v3 adds 'cancellation_failed' — both keep
-        // holding leases. CREATE INDEX IF NOT EXISTS never updates an existing
-        // definition, so the index is rebuilt.
+      if (current < 4) {
+        // v2 added 'cancelling'; v3 added 'cancellation_failed'; v4 adds
+        // 'termination_failed' — all three keep holding leases. CREATE INDEX
+        // IF NOT EXISTS never updates an existing definition, so the index is
+        // rebuilt from scratch every time this list grows.
         this.sqlite.exec('DROP INDEX IF EXISTS attempts_one_active');
         this.sqlite.exec(
           "CREATE UNIQUE INDEX attempts_one_active ON attempts(task_id) " +
-            "WHERE state IN ('creating_worktree','running','validating','cancelling','cancellation_failed')",
+            "WHERE state IN ('creating_worktree','running','validating','cancelling','cancellation_failed','termination_failed')",
         );
       }
       this.setMeta('schema_version', String(SCHEMA_VERSION));

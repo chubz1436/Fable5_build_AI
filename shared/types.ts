@@ -357,6 +357,7 @@ export type AttemptState =
   | 'validating'
   | 'cancelling'               // owner cancelled; termination not yet proven
   | 'cancellation_failed'      // termination could NOT be proven; leases stay held
+  | 'termination_failed'       // automatic timeout/error cleanup could NOT prove termination; leases stay held
   | 'ready_for_review'
   | 'accepted'
   | 'rejected'
@@ -376,6 +377,9 @@ export const ACTIVE_ATTEMPT_STATES: AttemptState[] = [
   // termination could not be proven — processes may still be running, so the
   // task/worker/repo leases MUST stay held until the owner resolves it
   'cancellation_failed',
+  // an automatic timeout/error cleanup could not prove termination either —
+  // same rule: leases stay held, worker stays busy, until it is resolved
+  'termination_failed',
 ];
 
 export type ExitReason =
@@ -514,6 +518,8 @@ export interface Attempt {
     livePids: number[];
     detail: string;
     at: string;
+    /** per-tracked-process breakdown folded into this merged proof (worker, each validation process, or a prior retry) */
+    sources?: Array<{ label: string; proven: boolean; captured: number[]; livePids: number[]; detail: string }>;
   } | null;
 }
 

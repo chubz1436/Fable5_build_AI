@@ -9,6 +9,7 @@ const STATE_TONE: Record<string, string> = {
   validating: 'b-accent',
   cancelling: 'b-warning',
   cancellation_failed: 'b-danger',
+  termination_failed: 'b-danger',
   ready_for_review: 'b-success',
   accepted: 'b-success',
   rejected: 'b-warning',
@@ -41,9 +42,10 @@ export function AttemptPanel({ attempt, operations }: { attempt: Attempt; operat
       setBusy(false);
     }
   };
-  // an attempt whose cancellation was never confirmed is NOT terminal: its
-  // processes may still be running and its leases are deliberately held
-  const terminal = !['creating_worktree', 'running', 'validating', 'cancelling', 'cancellation_failed'].includes(
+  // an attempt whose cancellation/termination was never confirmed is NOT
+  // terminal: its processes may still be running and its leases are
+  // deliberately held
+  const terminal = !['creating_worktree', 'running', 'validating', 'cancelling', 'cancellation_failed', 'termination_failed'].includes(
     attempt.state,
   );
   // truthful cleanup semantics (P0-2): with a checkpoint the work survives on

@@ -6,7 +6,7 @@ import type {
 } from '../../../shared/types';
 import { nowIso, uid } from '../domain/util';
 import { minimalValidationEnv } from './env';
-import { killProcessTree, redactSecrets, resolveExecutable, spawnSafe } from './runners';
+import { redactSecrets, resolveExecutable, spawnSafe, terminateTree, type TerminationProof } from './runners';
 
 /**
  * Independent validation runner (P0.9, hardened per P0-1/P0-3). The Command
@@ -52,9 +52,23 @@ export interface RunValidationOptions {
   /**
    * Called with every spawned validation process so the caller can track it and
    * PROVE its whole tree is dead on cancellation. Called again (same process)
-   * when it closes, so the tracker can forget it.
+   * ONLY once its termination is fully settled (proven or not) — never merely
+   * because its stdio closed, which is not proof the whole tree died.
    */
   onProcess?: (proc: ChildProcess, event: 'spawned' | 'closed') => void;
+  /**
+   * Terminate a validation process tree and PROVE it — overridable so the
+   * caller can dedupe/cache the proof per process (never re-derive a tree
+   * that has already been partially torn down). Defaults to `terminateTree`.
+   */
+  terminate?: (proc: ChildProcess) => Promise<TerminationProof>;
+  /**
+   * Fired once a FORCED termination (timeout or cancellation) settles,
+   * proven or not. Callers must retain leases when any reported proof is
+   * unproven — do not infer success just because the command's promise
+   * eventually resolved.
+   */
+  onTermination?: (proof: TerminationProof, ctx: { command: string; reason: 'timeout' | 'cancelled' }) => void;
 }
 
 export async function runValidation(
@@ -63,7 +77,8 @@ export async function runValidation(
   onLog: (line: string, level?: 'info' | 'warning' | 'error') => void,
   options: RunValidationOptions = {},
 ): Promise<AttemptValidation> {
-  const { signal, beforeCommand, onProcess } = options;
+  const { signal, beforeCommand, onProcess, onTermination } = options;
+  const terminate = options.terminate ?? ((proc: ChildProcess) => terminateTree(proc));
   if (commands.length === 0) {
     onLog('[verify] no validation commands configured — result is UNVERIFIED', 'warning');
     return { status: 'UNVERIFIED', steps: [], completedAt: nowIso() };
@@ -155,16 +170,46 @@ export async function runValidation(
           };
           proc.stdout?.on('data', feed);
           proc.stderr?.on('data', feed);
+
+          // a single termination call for this proc, however many callers ask
+          // for it (a timeout AND an abort can race) — never issue two
+          // independent terminateTree calls against the same process, since a
+          // second capture after the first already killed the root would see
+          // a shrunk tree and understate what needs to be proven dead
+          let terminating: Promise<TerminationProof> | null = null;
+          const terminateOnce = (reason: 'timeout' | 'cancelled'): Promise<TerminationProof> => {
+            if (!terminating) {
+              terminating = terminate(proc!).then((proof) => {
+                onTermination?.(proof, { command: cmd.name, reason });
+                return proof;
+              });
+            }
+            return terminating;
+          };
+
+          let closeCode: number | null = null;
+          let settled = false;
+          const settle = (o: { code: number | null; timedOut: boolean; wasCancelled: boolean; tail: string[] }) => {
+            if (settled) return;
+            settled = true;
+            // untrack ONLY once termination is fully settled (proven or not)
+            // — never merely because stdio closed, which is not proof the
+            // whole tree died
+            onProcess?.(proc!, 'closed');
+            resolve(o);
+          };
+
           const timer = setTimeout(() => {
             timedOut = true;
-            killProcessTree(proc);
+            void terminateOnce('timeout').then(() => settle({ code: closeCode, timedOut, wasCancelled, tail }));
           }, cmd.timeoutMs);
           timer.unref?.();
           // P0-3: cancellation kills the live validation process tree; we only
-          // resolve on 'close', so termination is proven before we return.
+          // resolve once termination is PROVEN (or the deadline expires),
+          // never merely on 'close'.
           const onAbort = () => {
             wasCancelled = true;
-            killProcessTree(proc);
+            void terminateOnce('cancelled').then(() => settle({ code: closeCode, timedOut, wasCancelled, tail }));
           };
           signal?.addEventListener('abort', onAbort, { once: true });
           // the abort may have fired while we awaited executable resolution —
@@ -173,14 +218,20 @@ export async function runValidation(
           proc.on('error', (err) => {
             clearTimeout(timer);
             signal?.removeEventListener('abort', onAbort);
-            onProcess?.(proc, 'closed');
-            resolve({ code: null, timedOut: false, wasCancelled, tail: [err.message] });
+            // a forced-termination path already in flight owns settlement —
+            // it awaits the full proof before resolving
+            if (timedOut || wasCancelled) return;
+            settle({ code: null, timedOut: false, wasCancelled, tail: [err.message] });
           });
           proc.on('close', (code) => {
             clearTimeout(timer);
             signal?.removeEventListener('abort', onAbort);
-            onProcess?.(proc, 'closed');
-            resolve({ code, timedOut, wasCancelled, tail });
+            closeCode = code;
+            // a forced-termination path owns settlement once triggered: it
+            // awaits the full termination proof, which may resolve after (or
+            // before) 'close' — a graceful close settles immediately here
+            if (timedOut || wasCancelled) return;
+            settle({ code, timedOut, wasCancelled, tail });
           });
         },
       );

@@ -39,10 +39,12 @@ import { captureGitBaseline, findSymlinkEscapes, readGitLinkFile, verifyWorktree
 import {
   CodexRunner,
   pidAlive,
+  reverifyDead,
   terminateTree,
   TestRunner,
   type RunnerHandle,
   type TerminationProof,
+  type TerminationProofSource,
   type WorkerRunner,
 } from './runners';
 import { runValidation } from './validator';
@@ -65,10 +67,26 @@ export class AttemptService {
   private live = new Map<string, RunnerHandle>(); // attemptId → handle
   /** one cancellation context per attempt, spanning every pipeline phase (P0-3) */
   private aborts = new Map<string, AbortController>();
-  /** in-flight process-tree termination per attempt; awaited before settling */
-  private terminations = new Map<string, Promise<void>>();
+  /**
+   * The ONE termination call in flight (or settled) for an attempt's worker
+   * tree. Every caller that wants the worker killed — the cancel endpoint,
+   * a pipeline race-check, proveAllTerminated — MUST go through
+   * terminateWorkerOnce() so this proof is computed exactly once. A second
+   * independent capture after the first has already killed the root would
+   * see a shrunk tree (reparented descendants vanish) and understate what
+   * needs to be proven dead.
+   */
+  private terminations = new Map<string, Promise<TerminationProof>>();
   /** live validation child processes per attempt (tracked for proven kills) */
   private validationProcs = new Map<string, Set<ChildProcess>>();
+  /** the ONE termination call in flight (or settled) for a given validation
+   * process — mirrors `terminations` above but keyed by process, since a
+   * single attempt can run several validation commands */
+  private procTerminations = new Map<ChildProcess, Promise<TerminationProof>>();
+  /** termination proofs validator.ts has already settled (proven or not) for
+   * a validation process that has fully closed, per attempt — folded into
+   * the merged proof without ever being recomputed */
+  private validationTerminationProofs = new Map<string, TerminationProof[]>();
   /** in-flight finalizeCancellation per attempt (the pipeline and the cancel
    * request can both reach it; they must not race) */
   private finalizing = new Map<string, Promise<void>>();
@@ -582,6 +600,55 @@ export class AttemptService {
       return;
     }
     this.validationProcs.get(attemptId)?.delete(proc);
+    // safe to drop: by the time 'closed' fires, its termination proof (if any
+    // kill was attempted) has already been captured in
+    // validationTerminationProofs via recordValidationTermination
+    this.procTerminations.delete(proc);
+  }
+
+  /**
+   * Begin (or join) the ONE termination call for this attempt's worker tree.
+   * Every caller — the cancel endpoint, a pipeline race-check,
+   * proveAllTerminated — must go through this so `handle.cancel()` (which
+   * captures the process tree) is invoked exactly once per attempt.
+   */
+  private terminateWorkerOnce(attemptId: string, handle: RunnerHandle): Promise<TerminationProof> {
+    let p = this.terminations.get(attemptId);
+    if (!p) {
+      p = handle.cancel().catch(
+        (err): TerminationProof => ({
+          proven: false,
+          captured: [],
+          livePids: [-1],
+          detail: `worker: termination attempt threw (${(err as Error).message})`,
+        }),
+      );
+      this.terminations.set(attemptId, p);
+    }
+    return p;
+  }
+
+  /** the ONE termination call for a given validation process (mirrors terminateWorkerOnce) */
+  private terminateProcOnce(proc: ChildProcess): Promise<TerminationProof> {
+    let p = this.procTerminations.get(proc);
+    if (!p) {
+      p = terminateTree(proc).catch(
+        (err): TerminationProof => ({
+          proven: false,
+          captured: proc.pid != null ? [proc.pid] : [],
+          livePids: proc.pid != null ? [proc.pid] : [-1],
+          detail: `termination attempt threw (${(err as Error).message})`,
+        }),
+      );
+      this.procTerminations.set(proc, p);
+    }
+    return p;
+  }
+
+  /** record a validation process's SETTLED termination proof (proven or not) — never recomputed later */
+  private recordValidationTermination(attemptId: string, proof: TerminationProof): void {
+    if (!this.validationTerminationProofs.has(attemptId)) this.validationTerminationProofs.set(attemptId, []);
+    this.validationTerminationProofs.get(attemptId)!.push(proof);
   }
 
   /**
@@ -702,7 +769,7 @@ export class AttemptService {
     this.store.updateAttempt(attempt);
     this.live.set(attemptId, handle);
     // a cancel may have raced the spawn — kill immediately, then await close
-    if (this.cancelRequested(attemptId)) handle.cancel();
+    if (this.cancelRequested(attemptId)) void this.terminateWorkerOnce(attemptId, handle);
 
     // P0.12/req-15: the readiness screen must report the same executable
     // target that was actually used to run the worker (created if absent).
@@ -727,6 +794,23 @@ export class AttemptService {
     // cancellation checkpoint: worker tree is proven dead at this point
     if (this.cancelRequested(attemptId) || outcome.exitReason === 'cancelled') {
       return this.finalizeCancellation(attemptId);
+    }
+
+    // a hard timeout is only safe to treat as a resolved failure once the
+    // WHOLE process tree is proven dead — an unproven kill must retain
+    // leases exactly like an unproven owner-cancellation (P0-3)
+    if (outcome.exitReason === 'timeout' && !(outcome.terminationProof?.proven ?? false)) {
+      return this.settleUnprovenTermination(
+        attemptId,
+        'timeout',
+        outcome.terminationProof ?? {
+          proven: false,
+          captured: [],
+          livePids: [-1],
+          detail: 'worker timeout termination proof unavailable',
+        },
+        'Automatic termination after a worker timeout',
+      );
     }
 
     if (outcome.exitReason !== 'success') {
@@ -785,6 +869,7 @@ export class AttemptService {
     this.event('verify.started', `Independent validation running in the attempt worktree (${project.git!.validationCommands.length} command(s))`, task.id, 'info', { attemptId });
 
     const valOp = this.op(attemptId, 'run_validation', `validate:${attemptId}:1`, JSON.stringify(project.git!.validationCommands.map((c) => c.argv)));
+    const validationTerminationProofs: TerminationProof[] = [];
     const validation = await runValidation(
       project.git!.validationCommands,
       worktreePath,
@@ -793,11 +878,28 @@ export class AttemptService {
         signal,
         beforeCommand: () => this.containmentGuard(worktreePath),
         onProcess: (proc, event) => this.trackValidationProcess(attemptId, proc, event),
+        terminate: (proc) => this.terminateProcOnce(proc),
+        onTermination: (proof) => {
+          this.recordValidationTermination(attemptId, proof);
+          validationTerminationProofs.push(proof);
+        },
       },
     );
     if (this.cancelRequested(attemptId)) {
       this.finishOp(valOp, 'failed', null, 'Cancelled by owner.');
       return this.finalizeCancellation(attemptId);
+    }
+    // a validation command's hard timeout is only safe to fold into a
+    // FAILED/PARTIAL delivery once its process tree is proven dead — an
+    // unproven kill must retain leases exactly like an unproven cancellation
+    if (validationTerminationProofs.some((p) => !p.proven)) {
+      this.finishOp(valOp, 'failed', null, 'A validation command timed out and its process tree could not be confirmed dead.');
+      return this.settleUnprovenTermination(
+        attemptId,
+        'timeout',
+        await this.proveAllTerminated(attemptId),
+        'Automatic termination after a validation command timeout',
+      );
     }
 
     // 6) post-validation snapshot: detect EVERY validation-produced
@@ -987,9 +1089,9 @@ export class AttemptService {
 
   private settleForReview(attemptId: string, validation: Attempt['validation'], evidence: AttemptEvidence, checkpointCommit: string | null): void {
     const attempt = this.store.attempt(attemptId)!;
-    // a cancelled/cancelling attempt must never be promoted to a delivery,
-    // even if the pipeline raced past a checkpoint
-    if (['cancelling', 'cancellation_failed', 'cancelled'].includes(attempt.state)) return;
+    // a cancelled/cancelling/unproven-termination attempt must never be
+    // promoted to a delivery, even if the pipeline raced past a checkpoint
+    if (['cancelling', 'cancellation_failed', 'termination_failed', 'cancelled'].includes(attempt.state)) return;
     const task = this.mustTask(attempt.taskId);
     this.aborts.delete(attemptId);
     this.store.tx(() => {
@@ -1027,9 +1129,9 @@ export class AttemptService {
       void this.finalizeCancellation(attemptId);
       return;
     }
-    // an unproven cancellation must never be overwritten by a generic failure —
-    // its leases are held on purpose
-    if (['cancelled', 'failed', 'timeout', 'accepted', 'rejected', 'cancellation_failed'].includes(attempt.state)) return;
+    // an unproven cancellation/termination must never be overwritten by a
+    // generic failure — its leases are held on purpose
+    if (['cancelled', 'failed', 'timeout', 'accepted', 'rejected', 'cancellation_failed', 'termination_failed'].includes(attempt.state)) return;
     this.live.delete(attemptId);
     this.aborts.delete(attemptId);
     this.validationProcs.delete(attemptId);
@@ -1120,17 +1222,18 @@ export class AttemptService {
       return this.store.task(taskId)!; // already cancelling; nothing new to do
     }
 
-    // a previously FAILED cancellation can be retried: re-attempt termination
-    // and re-verify, without ever claiming success in between
-    if (attempt && attempt.state === 'cancellation_failed') {
+    // a previously FAILED termination (owner cancellation OR an automatic
+    // timeout) can be retried: re-attempt termination and re-verify, without
+    // ever claiming success in between
+    if (attempt && (attempt.state === 'cancellation_failed' || attempt.state === 'termination_failed')) {
       this.store.tx(() => {
         const a = this.store.attempt(attempt.id)!;
         a.state = 'cancelling';
-        a.failureReason = 'Retrying cancellation — re-attempting termination of the tracked process tree.';
+        a.failureReason = 'Retrying termination — re-attempting to confirm the tracked process tree is dead.';
         this.store.updateAttempt(a);
       });
       this.aborts.get(attempt.id)?.abort();
-      this.event('task.cancelling', `Retrying cancellation of attempt ${attempt.id}`, task.id, 'warning', { attemptId: attempt.id });
+      this.event('task.cancelling', `Retrying termination of attempt ${attempt.id}`, task.id, 'warning', { attemptId: attempt.id });
       void this.finalizeCancellation(attempt.id);
       return this.store.task(taskId)!;
     }
@@ -1148,20 +1251,10 @@ export class AttemptService {
       });
       // fire the shared cancellation context; every pipeline phase checks it
       this.aborts.get(attempt.id)?.abort();
-      // track the tree-termination so finalizeCancellation can AWAIT it —
+      // begin (or join) the ONE termination call for this attempt's worker
+      // tree so finalizeCancellation can await its authoritative proof —
       // nothing settles until the whole process tree is proven dead
-      if (handle) {
-        this.terminations.set(
-          attempt.id,
-          (async () => {
-            try {
-              await handle.cancel();
-            } catch {
-              /* termination is verified by the proof below */
-            }
-          })(),
-        );
-      }
+      if (handle) void this.terminateWorkerOnce(attempt.id, handle);
       // Drive finalization from here rather than relying on a pipeline
       // checkpoint: a worker that refuses to die never resolves `done`, so the
       // pipeline would stall and the attempt would sit in `cancelling` forever
@@ -1183,42 +1276,77 @@ export class AttemptService {
    * Terminate every tracked process for the attempt (worker tree + any live
    * validation trees) and report a COMBINED proof. `proven` is true only when
    * every captured pid of every tracked process is confirmed dead.
+   *
+   * Every branch below goes through a cache (terminateWorkerOnce /
+   * terminateProcOnce) or consults an ALREADY-SETTLED proof
+   * (validationTerminationProofs, attempt.terminationProof.captured) — this
+   * function must never independently re-derive a process tree that a prior
+   * call already captured. A dead root's already-reparented descendants
+   * vanish from a fresh scan, which would silently shrink what gets proven
+   * dead and could report `proven: true` over a genuinely surviving process.
    */
   private async proveAllTerminated(attemptId: string): Promise<TerminationProof> {
     const captured = new Set<number>();
     const live = new Set<number>();
     const details: string[] = [];
+    const sources: TerminationProofSource[] = [];
 
     const merge = (p: TerminationProof, label: string): void => {
       for (const c of p.captured) captured.add(c);
       for (const l of p.livePids) live.add(l);
       if (!p.proven) details.push(`${label}: ${p.detail}`);
+      sources.push({ label, proven: p.proven, captured: p.captured, livePids: p.livePids, detail: p.detail });
     };
 
-    // worker tree
-    const handle = this.live.get(attemptId);
-    if (handle) {
-      try {
-        merge(await handle.cancel(), 'worker');
-      } catch (err) {
-        details.push(`worker: termination attempt threw (${(err as Error).message})`);
-        live.add(-1); // unknown state → cannot be proven
+    // worker tree: reuse the cached FIRST-capture proof if termination was
+    // already initiated (owner cancel or a pipeline race-check); only start
+    // a new one if nothing is in flight yet
+    const cachedWorker = this.terminations.get(attemptId);
+    if (cachedWorker) {
+      merge(await cachedWorker, 'worker');
+    } else {
+      const handle = this.live.get(attemptId);
+      if (handle) {
+        try {
+          merge(await this.terminateWorkerOnce(attemptId, handle), 'worker');
+        } catch (err) {
+          details.push(`worker: termination attempt threw (${(err as Error).message})`);
+          live.add(-1); // unknown state → cannot be proven
+        }
       }
     }
 
-    // any validation process trees still tracked for this attempt
+    // validation process trees still actively tracked (their own
+    // timeout/abort handler in validator.ts hasn't settled them yet, or they
+    // were never killed at all) — go through the SAME per-process cache
+    // validator.ts uses, so whichever side calls first is authoritative
     for (const proc of this.validationProcs.get(attemptId) ?? []) {
       try {
-        merge(await terminateTree(proc), `validation pid ${proc.pid ?? '?'}`);
+        merge(await this.terminateProcOnce(proc), `validation pid ${proc.pid ?? '?'}`);
       } catch (err) {
         details.push(`validation: termination attempt threw (${(err as Error).message})`);
         live.add(-1);
       }
     }
+    // validation terminations validator.ts already settled (proven or not) —
+    // fold in the recorded proof, never recompute it
+    for (const proof of this.validationTerminationProofs.get(attemptId) ?? []) {
+      merge(proof, 'validation (recorded)');
+    }
+
+    // fold in every pid this attempt has EVER been told about, from a prior
+    // unproven attempt (cancellation_failed or termination_failed) — RE-KILL
+    // and re-verify those exact pids rather than trusting a fresh tree
+    // derivation, which would silently drop a descendant whose parent has
+    // already died and been reparented away
+    const attempt = this.store.attempt(attemptId);
+    const priorCaptured = attempt?.terminationProof?.captured ?? [];
+    if (priorCaptured.length > 0) {
+      merge(await reverifyDead(attempt?.pid ?? priorCaptured[0]!, priorCaptured, 5_000), 'previously captured');
+    }
 
     // the attempt's recorded root pid must also be gone even if the handle was
     // already dropped (e.g. after a phase transition)
-    const attempt = this.store.attempt(attemptId);
     if (attempt?.pid != null) {
       captured.add(attempt.pid);
       if (pidAlive(attempt.pid)) {
@@ -1233,10 +1361,53 @@ export class AttemptService {
       proven,
       captured: [...captured],
       livePids,
+      sources,
       detail: proven
         ? `all ${captured.size} tracked process(es) confirmed dead`
         : details.join('; ') || 'termination could not be confirmed',
     };
+  }
+
+  /**
+   * Shared settlement for an UNPROVEN termination — owner cancellation or an
+   * automatic timeout, it makes no difference to the safety rule: leases stay
+   * held, the worker stays busy, and nothing claims the processes died.
+   * `kind` picks the attempt state: 'cancellation' → `cancellation_failed`
+   * (owner asked to stop it), 'timeout' → `termination_failed` (automatic
+   * cleanup couldn't prove it).
+   */
+  private settleUnprovenTermination(attemptId: string, kind: 'cancellation' | 'timeout', proof: TerminationProof, context: string): void {
+    const attempt = this.store.attempt(attemptId);
+    if (!attempt) return;
+    const state: Attempt['state'] = kind === 'cancellation' ? 'cancellation_failed' : 'termination_failed';
+    const proofRecord = { ...proof, at: nowIso() };
+    this.store.tx(() => {
+      const a = this.store.attempt(attemptId)!;
+      a.state = state;
+      a.exitReason = 'unknown';
+      a.terminationProof = proofRecord;
+      a.failureReason =
+        `${context} could NOT be confirmed: ${proof.detail}. ` +
+        'One or more processes may still be running, so the task/worker/repository leases remain held and the attempt is not marked cancelled. ' +
+        'Inspect the listed pids and terminate them, then retry termination.';
+      this.store.updateAttempt(a);
+      // NOTE: no releaseLeases(), no freeWorker() — deliberately.
+      const t = this.store.task(a.taskId);
+      if (t && !['completed', 'cancelled', 'failed'].includes(t.status)) {
+        t.phase = `${kind === 'cancellation' ? 'Cancellation' : 'Termination'} failed — processes may still be running`;
+        this.store.upsertTask(t);
+      }
+    });
+    const task = this.store.task(attempt.taskId);
+    if (task) {
+      this.event(
+        kind === 'cancellation' ? 'task.cancellation_failed' : 'task.termination_failed',
+        `⚠ ${context} of attempt ${attemptId} could NOT be confirmed — ${proof.detail}. Leases remain held; the task is NOT marked cancelled.`,
+        task.id,
+        'error',
+        { attemptId, livePids: proof.livePids },
+      );
+    }
   }
 
   /**
@@ -1256,59 +1427,36 @@ export class AttemptService {
 
   private async finalizeCancellationInner(attemptId: string): Promise<void> {
     const attempt = this.store.attempt(attemptId);
-    if (!attempt || ['cancelled', 'failed', 'timeout', 'accepted', 'rejected', 'cancellation_failed'].includes(attempt.state)) {
+    if (
+      !attempt ||
+      ['cancelled', 'failed', 'timeout', 'accepted', 'rejected', 'cancellation_failed', 'termination_failed'].includes(attempt.state)
+    ) {
       return;
     }
 
     // ── PROVE termination BEFORE settling state or releasing any lease ──
-    const pending = this.terminations.get(attemptId);
-    if (pending) await pending;
     const proof = await this.proveAllTerminated(attemptId);
     this.terminations.delete(attemptId);
 
     const task = this.store.task(attempt.taskId);
-    const proofRecord = { ...proof, at: nowIso() };
 
     if (!proof.proven) {
       // Cancellation FAILED: processes may still be running. Keep the leases,
       // keep the worker busy, and say so plainly.
-      this.store.tx(() => {
-        const a = this.store.attempt(attemptId)!;
-        a.state = 'cancellation_failed';
-        a.exitReason = 'unknown';
-        a.terminationProof = proofRecord;
-        a.failureReason =
-          `Cancellation could NOT be confirmed: ${proof.detail}. ` +
-          'One or more processes may still be running, so the task/worker/repository leases remain held and the attempt is not marked cancelled. ' +
-          'Inspect the listed pids and terminate them, then retry cancellation.';
-        this.store.updateAttempt(a);
-        // NOTE: no releaseLeases(), no freeWorker() — deliberately.
-        const t = this.store.task(a.taskId);
-        if (t && !['completed', 'cancelled', 'failed'].includes(t.status)) {
-          t.phase = 'Cancellation failed — processes may still be running';
-          this.store.upsertTask(t);
-        }
-      });
+      this.settleUnprovenTermination(attemptId, 'cancellation', proof, 'Cancellation');
       const cancelOpFailed = this.store
         .operationsForAttempt(attemptId)
         .find((o) => o.kind === 'cancel_worker' && o.status === 'running');
       if (cancelOpFailed) this.finishOp(cancelOpFailed, 'failed', null, proof.detail);
-      if (task) {
-        this.event(
-          'task.cancellation_failed',
-          `⚠ Cancellation of attempt ${attemptId} could NOT be confirmed — ${proof.detail}. Leases remain held; the task is NOT marked cancelled.`,
-          task.id,
-          'error',
-          { attemptId, livePids: proof.livePids },
-        );
-      }
       return;
     }
 
     // proven dead → safe to settle and release
+    const proofRecord = { ...proof, at: nowIso() };
     this.live.delete(attemptId);
     this.aborts.delete(attemptId);
     this.validationProcs.delete(attemptId);
+    this.validationTerminationProofs.delete(attemptId);
     this.store.tx(() => {
       attempt.state = 'cancelled';
       attempt.exitReason = 'cancelled';
@@ -1373,6 +1521,7 @@ export class AttemptService {
     const n = this.store.operationsForAttempt(attemptId).filter((o) => o.kind === 'run_validation').length + 1;
     const valOp = this.op(attemptId, 'run_validation', `validate:${attemptId}:${n}`, JSON.stringify(project.git!.validationCommands.map((c) => c.argv)));
     const preTree = await writeTreeSnapshot(worktree);
+    const revalTerminationProofs: TerminationProof[] = [];
     const validation = await runValidation(
       project.git!.validationCommands,
       worktree,
@@ -1380,8 +1529,21 @@ export class AttemptService {
       {
         beforeCommand: () => this.containmentGuard(worktree),
         onProcess: (proc, event) => this.trackValidationProcess(attemptId, proc, event),
+        terminate: (proc) => this.terminateProcOnce(proc),
+        onTermination: (proof) => {
+          this.recordValidationTermination(attemptId, proof);
+          revalTerminationProofs.push(proof);
+        },
       },
     );
+    const unprovenReval = revalTerminationProofs.find((p) => !p.proven);
+    if (unprovenReval) {
+      this.finishOp(valOp, 'failed', null, 'A validation command timed out and its process tree could not be confirmed dead.');
+      throw new LifecycleError(
+        `Re-validation timed out and the command's process tree could NOT be confirmed dead (${unprovenReval.detail}). ` +
+          'The worktree may still be in use — inspect the listed pids before retrying.',
+      );
+    }
     const postTree = await writeTreeSnapshot(worktree);
     const mutations = postTree === preTree ? [] : await diffTreePaths(worktree, preTree, postTree);
 
@@ -1440,6 +1602,12 @@ export class AttemptService {
       throw new LifecycleError(
         'Cancellation of this attempt was never confirmed — processes may still be writing to the worktree. ' +
           'Terminate the recorded pids and retry cancellation before cleaning up.',
+      );
+    }
+    if (attempt.state === 'termination_failed') {
+      throw new LifecycleError(
+        'Automatic termination of this attempt was never confirmed — processes may still be writing to the worktree. ' +
+          'Terminate the recorded pids and retry termination before cleaning up.',
       );
     }
     if (!attempt.worktreePath || attempt.worktreeCleanedAt) return attempt;
@@ -1546,6 +1714,17 @@ export class AttemptService {
           'Cancellation was in progress when the Command Center restarted, so child-process termination could NOT be re-verified. ' +
           'Processes started by the previous run may still be alive: check the recorded pids, terminate anything still running, then retry cancellation. ' +
           'The task/worker/repository leases remain held and the worktree is preserved.';
+      } else if (attempt.state === 'termination_failed') {
+        // same reasoning as cancellation_failed above, except this attempt
+        // was never owner-cancelled — an automatic timeout/error cleanup
+        // couldn't prove termination before the restart. Stays
+        // termination_failed and KEEPS its leases.
+        attempt.state = 'termination_failed';
+        attempt.exitReason = 'unknown';
+        attempt.failureReason =
+          'Automatic termination was in progress when the Command Center restarted, so child-process termination could NOT be re-verified. ' +
+          'Processes started by the previous run may still be alive: check the recorded pids, terminate anything still running, then retry termination. ' +
+          'The task/worker/repository leases remain held and the worktree is preserved.';
       } else {
         attempt.state = 'failed';
         attempt.exitReason = 'unknown';
@@ -1553,8 +1732,8 @@ export class AttemptService {
       }
       attempt.endedAt = nowIso();
       this.store.updateAttempt(attempt);
-      // an unproven cancellation keeps its leases and its busy worker
-      if (attempt.state !== 'cancellation_failed') {
+      // an unproven cancellation/termination keeps its leases and its busy worker
+      if (!['cancellation_failed', 'termination_failed'].includes(attempt.state)) {
         this.store.releaseLeases(attempt.id);
         this.freeWorker(attempt.workerId);
       }

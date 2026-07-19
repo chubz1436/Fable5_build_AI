@@ -186,6 +186,49 @@ export interface TerminationProof {
   /** pids still alive when the deadline expired */
   livePids: number[];
   detail: string;
+  /** per-tracked-process breakdown folded into this merged proof (P1) */
+  sources?: TerminationProofSource[];
+}
+
+/** one tracked process tree's contribution to a merged TerminationProof */
+export interface TerminationProofSource {
+  label: string;
+  proven: boolean;
+  captured: number[];
+  livePids: number[];
+  detail: string;
+}
+
+/**
+ * The minimal, narrow seam between termination logic and the OS. Production
+ * uses the real OS backend (below); tests inject a deterministic fake so
+ * safety-critical kill/verify code never has to touch a real system PID.
+ */
+export interface ProcessBackend {
+  /** every descendant of rootPid (root included), captured BEFORE any kill */
+  captureTree(rootPid: number): Promise<number[]>;
+  /** send a termination signal to pid; group=true signals the whole POSIX process group (Windows: the whole tree via taskkill /T) */
+  kill(pid: number, opts?: { group?: boolean }): Promise<void>;
+  /** true if pid is alive right now (EPERM counts as alive — it exists) */
+  pidAlive(pid: number): boolean;
+  /** true if the POSIX process group led by pgid still has members (always false on Windows) */
+  groupAlive(pgid: number): boolean;
+  /** sleep for ms (a fake backend can resolve immediately for fast deterministic tests) */
+  wait(ms: number): Promise<void>;
+}
+
+/**
+ * PID 0 (own/self group), PID 1 (init/launchd) and — on Windows — PID 4
+ * (System) are never valid termination targets: signalling them means either
+ * "every process I can touch" (POSIX group semantics for 0/negative) or a
+ * real system process. A negative pid is never legitimate either. Every path
+ * that would otherwise reach `kill(-1, …)` or `kill(0, …)` must be rejected
+ * here BEFORE any signal is sent.
+ */
+export function isSafeRootPid(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid < 2) return false;
+  if (WIN && pid === 4) return false;
+  return true;
 }
 
 /** snapshot of (pid, ppid) for every process on the machine */
@@ -273,6 +316,7 @@ export async function captureProcessTree(rootPid: number): Promise<number[]> {
 /** true when the POSIX process group led by `pgid` still has members */
 function groupAlive(pgid: number): boolean {
   if (WIN) return false;
+  if (!isSafeRootPid(pgid)) return false; // never probe -1/-0/negative
   try {
     process.kill(-pgid, 0);
     return true;
@@ -281,76 +325,101 @@ function groupAlive(pgid: number): boolean {
   }
 }
 
-/**
- * Terminate a process tree and PROVE it is gone.
- *
- *   1. capture the whole descendant closure while the links still exist;
- *   2. kill — Windows: one `taskkill /T /F` on the root (never the cmd.exe
- *      wrapper first, never a delayed kill, which orphans the real worker);
- *      POSIX: signal the process GROUP (children are spawned detached so they
- *      lead their own group), which reaches detached/background descendants;
- *   3. poll until EVERY captured pid is dead (and, on POSIX, the group is
- *      empty) or the deadline expires.
- *
- * A deadline expiry returns `proven: false` with the surviving pids. Callers
- * must treat that as a failed cancellation.
- */
-export async function terminateTree(proc: ChildProcess, deadlineMs = 15_000): Promise<TerminationProof> {
-  const pid = proc.pid;
-  if (pid == null) {
-    return { proven: true, captured: [], livePids: [], detail: 'process was never started' };
-  }
-  const captured = await captureProcessTree(pid);
+/** windows: one taskkill /T /F, awaited to completion (or an 10s internal cap) */
+function taskkill(pid: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+    try {
+      const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.on('error', done);
+      killer.on('close', done);
+    } catch {
+      done();
+    }
+    setTimeout(done, 10_000).unref?.();
+  });
+}
 
+/**
+ * The real OS-backed ProcessBackend. Every destructive call is guarded by
+ * `isSafeRootPid` so this backend can NEVER issue `kill(-1, …)`, `kill(0, …)`,
+ * or a signal against PID 1/4 — the guard sits here, at the lowest level,
+ * rather than relying on every caller to check first.
+ */
+export const osProcessBackend: ProcessBackend = {
+  captureTree: captureProcessTree,
+  async kill(pid, opts) {
+    if (!isSafeRootPid(pid)) {
+      throw new Error(`Refusing to signal unsafe pid ${pid} (PID 0/1/4 and negative pids are never valid termination targets).`);
+    }
+    if (WIN) {
+      await taskkill(pid); // /T already kills the tree rooted at pid
+      return;
+    }
+    if (opts?.group) {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        /* already gone or no permission */
+      }
+    } else {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  },
+  pidAlive,
+  groupAlive,
+  wait(ms) {
+    return new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      t.unref?.();
+    });
+  },
+};
+
+/** default backend for production code paths; tests inject a fake instead */
+export const defaultProcessBackend: ProcessBackend = osProcessBackend;
+
+/**
+ * Kill + verify an ALREADY-CAPTURED pid set against `backend`, polling until
+ * every pid is dead (and, on POSIX, the group is empty) or `deadlineMs`
+ * expires. Shared by `terminateTree` (fresh capture) and `reverifyDead`
+ * (retry against a previously captured set) so neither path re-derives the
+ * tree mid-flight.
+ */
+async function killAndPoll(rootPid: number, captured: number[], deadlineMs: number, backend: ProcessBackend): Promise<TerminationProof> {
   const kill = async (): Promise<void> => {
     if (WIN) {
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const done = () => {
-          if (!settled) {
-            settled = true;
-            resolve();
-          }
-        };
-        try {
-          const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-          killer.on('error', done);
-          killer.on('close', done);
-        } catch {
-          done();
-        }
-        setTimeout(done, 10_000).unref?.();
-      });
+      await backend.kill(rootPid, { group: true }); // taskkill /T reaches the tree rooted at rootPid
       // sweep any captured descendant taskkill could not reach through the tree
       for (const p of captured) {
-        if (p !== pid && pidAlive(p)) {
-          await new Promise<void>((resolve) => {
-            try {
-              const k = spawn('taskkill', ['/pid', String(p), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-              k.on('error', () => resolve());
-              k.on('close', () => resolve());
-            } catch {
-              resolve();
-            }
-          });
-        }
+        if (p !== rootPid && backend.pidAlive(p)) await backend.kill(p);
       }
       return;
     }
     // POSIX: the group first (covers detached descendants), then stragglers
     try {
-      process.kill(-pid, 'SIGKILL');
+      await backend.kill(rootPid, { group: true });
     } catch {
       try {
-        proc.kill('SIGKILL');
+        await backend.kill(rootPid);
       } catch {
         /* already gone */
       }
     }
     for (const p of captured) {
-      if (pidAlive(p)) {
+      if (backend.pidAlive(p)) {
         try {
-          process.kill(p, 'SIGKILL');
+          await backend.kill(p);
         } catch {
           /* already gone */
         }
@@ -362,14 +431,14 @@ export async function terminateTree(proc: ChildProcess, deadlineMs = 15_000): Pr
 
   // verify the COMPLETE captured tree, not just the root
   const deadline = Date.now() + deadlineMs;
-  let livePids = captured.filter((p) => pidAlive(p));
-  let groupStillAlive = !WIN && groupAlive(pid);
+  let livePids = captured.filter((p) => backend.pidAlive(p));
+  let groupStillAlive = !WIN && backend.groupAlive(rootPid);
   let sweeps = 0;
   while ((livePids.length > 0 || groupStillAlive) && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 200));
+    await backend.wait(200);
     if (++sweeps % 10 === 0) await kill(); // periodic re-kill for stubborn trees
-    livePids = captured.filter((p) => pidAlive(p));
-    groupStillAlive = !WIN && groupAlive(pid);
+    livePids = captured.filter((p) => backend.pidAlive(p));
+    groupStillAlive = !WIN && backend.groupAlive(rootPid);
   }
 
   const proven = livePids.length === 0 && !groupStillAlive;
@@ -383,6 +452,75 @@ export async function terminateTree(proc: ChildProcess, deadlineMs = 15_000): Pr
         (groupStillAlive ? ' (process group still has members)' : '') +
         (livePids.length ? `: pids ${livePids.join(', ')}` : ''),
   };
+}
+
+/**
+ * Terminate a process tree and PROVE it is gone.
+ *
+ *   1. capture the whole descendant closure while the links still exist —
+ *      exactly ONCE. A second, independent capture after the root has died
+ *      would silently miss any descendant that was reparented away from it
+ *      (it no longer shows up as a child of a dead pid), understating what
+ *      this call is responsible for proving dead. Callers must never call
+ *      this twice for the same logical termination and discard the first
+ *      result — cache and reuse it (see AttemptService.terminateWorkerOnce);
+ *   2. kill — Windows: one `taskkill /T /F` on the root (never the cmd.exe
+ *      wrapper first, never a delayed kill, which orphans the real worker);
+ *      POSIX: signal the process GROUP (children are spawned detached so they
+ *      lead their own group), which reaches detached/background descendants;
+ *   3. poll until EVERY captured pid is dead (and, on POSIX, the group is
+ *      empty) or the deadline expires.
+ *
+ * A deadline expiry returns `proven: false` with the surviving pids. Callers
+ * must treat that as a failed cancellation. `rootPid` is validated against
+ * `isSafeRootPid` before anything else runs — PID 0/1/4/negative are refused
+ * outright, never captured, never signalled.
+ */
+export async function terminateTree(
+  proc: ChildProcess,
+  deadlineMs = 15_000,
+  backend: ProcessBackend = defaultProcessBackend,
+): Promise<TerminationProof> {
+  const pid = proc.pid;
+  if (pid == null) {
+    return { proven: true, captured: [], livePids: [], detail: 'process was never started' };
+  }
+  if (!isSafeRootPid(pid)) {
+    return {
+      proven: false,
+      captured: [],
+      livePids: [pid],
+      detail: `refusing to terminate unsafe root pid ${pid} (PID 0/1/4 and negative pids are never valid termination targets)`,
+    };
+  }
+  const captured = await backend.captureTree(pid);
+  return killAndPoll(pid, captured, deadlineMs, backend);
+}
+
+/**
+ * Re-attempt termination of an ALREADY-KNOWN captured pid set — e.g. a retry
+ * after a prior unproven cancellation or timeout — WITHOUT ever re-deriving
+ * the process tree. Re-capturing on retry is exactly the bug this avoids: a
+ * root that already died has no discoverable children left in a fresh scan,
+ * so a naive retry would silently drop any surviving descendant from what it
+ * verifies. This re-kills and re-polls the SAME pids the first attempt
+ * captured, so a still-alive descendant is never lost.
+ */
+export async function reverifyDead(
+  rootPid: number,
+  captured: number[],
+  deadlineMs = 5_000,
+  backend: ProcessBackend = defaultProcessBackend,
+): Promise<TerminationProof> {
+  if (!isSafeRootPid(rootPid)) {
+    return {
+      proven: false,
+      captured,
+      livePids: captured.filter((p) => backend.pidAlive(p)),
+      detail: `refusing to operate on unsafe root pid ${rootPid} (PID 0/1/4 and negative pids are never valid termination targets)`,
+    };
+  }
+  return killAndPoll(rootPid, captured, deadlineMs, backend);
 }
 
 /** fire-and-forget termination used by timeout paths (proof not required) */
@@ -409,6 +547,12 @@ export interface RunnerOutcome {
   exitCode: number | null;
   error: string | null;
   logTail: string[];
+  /**
+   * Set ONLY when this outcome was reached via a forced termination (a hard
+   * timeout). Callers MUST check `.proven` before treating leases as safe to
+   * release — an unproven kill means the process tree may still be alive.
+   */
+  terminationProof?: TerminationProof;
 }
 
 export interface RunnerHandle {
@@ -459,39 +603,72 @@ function runSession(
   proc.stdout?.on('data', (c: Buffer) => feed(c));
   proc.stderr?.on('data', (c: Buffer) => feed(c, 'warning'));
 
+  // a single termination call for this proc, however many callers ask for it
+  // (the internal timeout timer AND an explicit cancel() can race) — never
+  // issue two independent terminateTree calls against the same process, since
+  // a second capture after the first has already killed the root would see a
+  // shrunk (or empty) tree and understate what actually needs to be proven dead
+  let terminating: Promise<TerminationProof> | null = null;
+  const terminateOnce = (): Promise<TerminationProof> => {
+    if (!terminating) terminating = terminateTree(proc);
+    return terminating;
+  };
+
+  let resolveDone!: (o: RunnerOutcome) => void;
+  const done = new Promise<RunnerOutcome>((resolve) => {
+    resolveDone = resolve;
+  });
+  let settled = false;
+  const settle = (o: RunnerOutcome) => {
+    if (settled) return;
+    settled = true;
+    resolveDone(o);
+  };
+  let closeCode: number | null = null;
+
   const timer = setTimeout(() => {
     timedOut = true;
     log(`Hard timeout after ${Math.round(launch.timeoutMs / 1000)}s — terminating process tree.`, 'error');
-    killProcessTree(proc);
+    // MUST await the full termination proof before settling `done` — a
+    // process that merely closed its stdio is not proof its whole tree died
+    void terminateOnce().then((proof) => {
+      settle({
+        exitReason: 'timeout',
+        exitCode: closeCode,
+        error: 'Worker exceeded the attempt time limit.',
+        logTail: tail,
+        terminationProof: proof,
+      });
+    });
   }, launch.timeoutMs);
   timer.unref?.();
 
-  const done = new Promise<RunnerOutcome>((resolve) => {
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      resolve({
-        exitReason: 'unavailable',
-        exitCode: null,
-        error: `Could not launch worker executable: ${err.message}`,
-        logTail: tail,
-      });
+  proc.on('error', (err) => {
+    clearTimeout(timer);
+    settle({
+      exitReason: 'unavailable',
+      exitCode: null,
+      error: `Could not launch worker executable: ${err.message}`,
+      logTail: tail,
     });
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      const exitReason = cancelled ? 'cancelled' : timedOut ? 'timeout' : classifyExit(code, collected, { cancelled, timedOut });
-      resolve({
-        exitReason,
-        exitCode: code,
-        error:
-          exitReason === 'success'
-            ? null
-            : exitReason === 'cancelled'
-              ? 'Cancelled by owner.'
-              : exitReason === 'timeout'
-                ? 'Worker exceeded the attempt time limit.'
-                : `Worker exit ${code}: ${tail.slice(-3).join(' | ') || 'no output'}`,
-        logTail: tail,
-      });
+  });
+  proc.on('close', (code) => {
+    clearTimeout(timer);
+    closeCode = code;
+    // the timeout branch owns resolution once it has fired: it awaits the
+    // full termination proof, which may resolve after (or before) 'close'
+    if (timedOut) return;
+    const exitReason = cancelled ? 'cancelled' : classifyExit(code, collected, { cancelled, timedOut });
+    settle({
+      exitReason,
+      exitCode: code,
+      error:
+        exitReason === 'success'
+          ? null
+          : exitReason === 'cancelled'
+            ? 'Cancelled by owner.'
+            : `Worker exit ${code}: ${tail.slice(-3).join(' | ') || 'no output'}`,
+      logTail: tail,
     });
   });
 
@@ -506,7 +683,7 @@ function runSession(
      */
     async cancel(): Promise<TerminationProof> {
       cancelled = true;
-      const proof = await terminateTree(proc);
+      const proof = await terminateOnce();
       await Promise.race([
         done.then(() => undefined),
         new Promise<void>((r) => setTimeout(r, 5_000).unref?.()),
